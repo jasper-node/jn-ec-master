@@ -1,0 +1,223 @@
+name: Build and Bundle Binaries
+
+on:
+  # Trigger on version tags (for releases)
+  push:
+    tags:
+      - "v*.*.*" # v1.0.0, v2.3.4, etc.
+
+  # Allow manual triggering (for testing)
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g., v1.0.0)"
+        required: false
+        type: string
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Build macOS Intel (x86_64)
+        run: |
+          cd ethercrab_ffi
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Build macOS Apple Silicon (aarch64)
+        run: |
+          cd ethercrab_ffi
+          cargo build --release --target aarch64-apple-darwin
+
+      - name: Prepare macOS binaries
+        run: |
+          mkdir -p dist/macos
+          cp ethercrab_ffi/target/x86_64-apple-darwin/release/libethercrab_ffi.dylib dist/macos/libethercrab_ffi-x86_64.dylib
+          cp ethercrab_ffi/target/aarch64-apple-darwin/release/libethercrab_ffi.dylib dist/macos/libethercrab_ffi-aarch64.dylib
+
+      - name: Upload macOS binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-binaries
+          path: dist/macos
+          retention-days: 7
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build Windows x86_64
+        run: |
+          cd ethercrab_ffi
+          cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Prepare Windows binary
+        run: |
+          mkdir -p dist/windows
+          cp ethercrab_ffi/target/x86_64-pc-windows-msvc/release/ethercrab_ffi.dll dist/windows/libethercrab_ffi.dll
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binary
+          path: dist/windows
+          retention-days: 7
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+
+      - name: Install cross-compilation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build Linux x86_64
+        run: |
+          cd ethercrab_ffi
+          cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Build Linux ARM64
+        run: |
+          cd ethercrab_ffi
+          cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Prepare Linux binaries
+        run: |
+          mkdir -p dist/linux
+          cp ethercrab_ffi/target/x86_64-unknown-linux-gnu/release/libethercrab_ffi.so dist/linux/libethercrab_ffi-x86_64.so
+          cp ethercrab_ffi/target/aarch64-unknown-linux-gnu/release/libethercrab_ffi.so dist/linux/libethercrab_ffi-aarch64.so
+
+      - name: Upload Linux binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: dist/linux
+          retention-days: 7
+
+  bundle:
+    needs: [build-macos, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download macOS binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-binaries
+          path: dist/artifacts/macos
+
+      - name: Download Windows binary
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-binary
+          path: dist/artifacts/windows
+
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-binaries
+          path: dist/artifacts/linux
+
+      - name: Organize binaries
+        run: |
+          mkdir -p dist/libs/{linuxA64,linux64,mac64,macA64,win64}
+
+          # Organize macOS binaries
+          cp dist/artifacts/macos/libethercrab_ffi-x86_64.dylib dist/libs/mac64/libethercrab_ffi.dylib
+          cp dist/artifacts/macos/libethercrab_ffi-aarch64.dylib dist/libs/macA64/libethercrab_ffi.dylib
+
+          # Organize Linux binaries
+          cp dist/artifacts/linux/libethercrab_ffi-x86_64.so dist/libs/linux64/libethercrab_ffi.so
+          cp dist/artifacts/linux/libethercrab_ffi-aarch64.so dist/libs/linuxA64/libethercrab_ffi.so
+
+          # Organize Windows binary
+          cp dist/artifacts/windows/libethercrab_ffi.dll dist/libs/win64/
+
+      - name: Create bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundled-binaries
+          path: dist/libs
+          retention-days: 30
+
+      - name: List bundled files
+        run: |
+          echo "Bundled binaries structure:"
+          find dist/libs -type f -name "*.so" -o -name "*.dll" -o -name "*.dylib" | sort
+
+      - name: Prepare lib/ folder structure for JSR
+        run: |
+          mkdir -p dist/lib-jsr
+          # Copy all binaries to lib/ with platform-specific names
+          # macOS: Create universal binary (will be done in release step if needed)
+          # For now, include both architectures - code will need to detect arch
+          cp dist/libs/mac64/libethercrab_ffi.dylib dist/lib-jsr/libethercrab_ffi-x86_64.dylib
+          cp dist/libs/macA64/libethercrab_ffi.dylib dist/lib-jsr/libethercrab_ffi-aarch64.dylib
+          # Linux: Include both architectures
+          cp dist/libs/linux64/libethercrab_ffi.so dist/lib-jsr/libethercrab_ffi-x86_64.so
+          cp dist/libs/linuxA64/libethercrab_ffi.so dist/lib-jsr/libethercrab_ffi-aarch64.so
+          # Windows
+          cp dist/libs/win64/libethercrab_ffi.dll dist/lib-jsr/libethercrab_ffi.dll
+
+      - name: Create release archive
+        run: |
+          cd dist/lib-jsr
+          zip -r ../lib-binaries.zip .
+          cd ../..
+
+      - name: Extract version from tag
+        id: tag_version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Version: ${VERSION}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag_version.outputs.version }}
+          name: Release ${{ steps.tag_version.outputs.version }}
+          body: |
+            Pre-compiled FFI binaries for all platforms.
+
+            ## Binaries included:
+            - macOS (x86_64): `libethercrab_ffi-x86_64.dylib`
+            - macOS (aarch64): `libethercrab_ffi-aarch64.dylib`
+            - Linux (x86_64): `libethercrab_ffi-x86_64.so`
+            - Linux (aarch64): `libethercrab_ffi-aarch64.so`
+            - Windows (x86_64): `libethercrab_ffi.dll`
+
+            Extract the archive and copy the appropriate binary to `lib/` folder:
+            - macOS: Use `libethercrab_ffi-x86_64.dylib` or `libethercrab_ffi-aarch64.dylib` → rename to `libethercrab_ffi.dylib`
+            - Linux: Use `libethercrab_ffi-x86_64.so` or `libethercrab_ffi-aarch64.so` → rename to `libethercrab_ffi.so`
+            - Windows: Use `libethercrab_ffi.dll` as-is
+          files: dist/lib-binaries.zip
+          draft: false
+          prerelease: ${{ contains(steps.tag_version.outputs.version, '-') || contains(steps.tag_version.outputs.version, 'beta') || contains(steps.tag_version.outputs.version, 'alpha') }}

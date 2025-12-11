@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<EtherCATConfig>
+  <Config>
+    <Master>
+      <Info>
+        <Name>TestMaster</Name>
+      </Info>
+    </Master>
+    <Slave>
+      <Info>
+        <Name>NoProtocol_Slave</Name>
+        <PhysAddr>1003</PhysAddr>
+        <AutoIncAddr>1003</AutoIncAddr>
+        <VendorId>0x00000002</VendorId>
+        <ProductCode>0x044c2c52</ProductCode>
+        <RevisionNo>0x00112233</RevisionNo>
+        <SerialNo>0x00000003</SerialNo>
+      </Info>
+      <ProcessData>
+        <RxPdo>
+          <Index>0x1600</Index>
+          <Name>RxPDO</Name>
+        </RxPdo>
+        <TxPdo>
+          <Index>0x1A00</Index>
+          <Name>TxPDO</Name>
+        </TxPdo>
+        <Recv>
+          <BitStart>0</BitStart>
+          <BitLength>8</BitLength>
+        </Recv>
+      </ProcessData>
+    </Slave>
+  </Config>
+</EtherCATConfig>

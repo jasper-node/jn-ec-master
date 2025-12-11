@@ -1,0 +1,34 @@
+# OS Files
+.DS_Store
+.idea/
+
+# Project Files
+ethercrab/**/*
+__old/
+tmp/
+
+# Rust Build Artifacts
+ethercrab_ffi/target
+ethercrab_ffi/target/
+**/target/
+
+# Build Artifacts (temporary build directory from CI/CD)
+# Note: libs/ directory is tracked and included in JSR package
+dist/
+# Ignore FFI binary files (but allow lib/ directory structure to be tracked)
+lib/libethercrab_ffi.dylib
+lib/libethercrab_ffi.so
+lib/libethercrab_ffi.dll
+lib/libethercrab_ffi*.dylib
+lib/libethercrab_ffi*.so
+lib/libethercrab_ffi*.dll
+discovered.json
+
+# Deno Cache
+.deno/
+
+# EtherCAT compliance files
+__compliance/
+
+# Environment variables
+.env*

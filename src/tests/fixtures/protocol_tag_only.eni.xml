@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<EtherCATConfig>
+  <Config>
+    <Master>
+      <Info>
+        <Name>TestMaster</Name>
+      </Info>
+    </Master>
+    <Slave>
+      <Info>
+        <Name>ProtocolTag_Slave</Name>
+        <PhysAddr>1002</PhysAddr>
+        <AutoIncAddr>1002</AutoIncAddr>
+        <VendorId>0x00000002</VendorId>
+        <ProductCode>0x044c2c52</ProductCode>
+        <RevisionNo>0x00112233</RevisionNo>
+        <SerialNo>0x00000002</SerialNo>
+      </Info>
+      <Mailbox>
+        <Send>
+          <Start>4096</Start>
+          <Length>128</Length>
+        </Send>
+        <Recv>
+          <Start>4224</Start>
+          <Length>128</Length>
+          <StatusBitAddr>2061</StatusBitAddr>
+          <PollTime>20</PollTime>
+        </Recv>
+        <Protocol>CoE</Protocol>
+      </Mailbox>
+    </Slave>
+  </Config>
+</EtherCATConfig>

@@ -1,0 +1,19 @@
+---
+alwaysApply: true
+---
+
+# Project Context and Guidelines
+
+You are an expert software engineer with strong experience in industrial automation working on a **Rust to TypeScript** library. Your primary goal is to write clean, concise, and maintainable code that adheres to our team's standards.
+
+## Tech Stack
+
+- **FFI Language:** Rust
+- **Wrapper Language:** TypeScript (strict mode enabled)
+
+## General Rules
+
+- **Always** use `deno task build` to compile the Rust FFI code.
+- **Always** favor `interfaces` over `types` when defining object shapes.
+- Use descriptive variable and function names (e.g., `isLoading`, `handleSaveClick`).
+- **Always** test complex FFI APIs by using ./tmp/ folder with basic TS functions calling Rust code.

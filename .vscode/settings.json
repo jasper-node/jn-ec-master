@@ -1,0 +1,25 @@
+{
+  "editor.formatOnSave": true,
+  "deno.enable": true,
+  "deno.disablePaths": [
+    "frontend"
+  ],
+  "deno.config": "deno.json",
+  "deno.lint": true,
+  "[typescript]": {
+    "editor.defaultFormatter": "denoland.vscode-deno"
+  },
+  "deno.testing.args": [
+    "-A"
+  ],
+  "deno.envFile": ".env",
+  "cSpell.words": [
+    "Ethercat",
+    "libc",
+    "maindevice",
+    "repr",
+    "smol",
+    "subdevice",
+    "SUBDEVICES"
+  ]
+}
