@@ -31,19 +31,17 @@ jobs:
 
       - name: Build macOS Intel (x86_64)
         run: |
-          cd ethercrab_ffi
-          cargo build --release --target x86_64-apple-darwin
+          cargo build -p ethercrab_ffi --release --target x86_64-apple-darwin
 
       - name: Build macOS Apple Silicon (aarch64)
         run: |
-          cd ethercrab_ffi
-          cargo build --release --target aarch64-apple-darwin
+          cargo build -p ethercrab_ffi --release --target aarch64-apple-darwin
 
       - name: Prepare macOS binaries
         run: |
           mkdir -p dist/macos
-          cp ethercrab_ffi/target/x86_64-apple-darwin/release/libethercrab_ffi.dylib dist/macos/libethercrab_ffi-x86_64.dylib
-          cp ethercrab_ffi/target/aarch64-apple-darwin/release/libethercrab_ffi.dylib dist/macos/libethercrab_ffi-aarch64.dylib
+          cp target/x86_64-apple-darwin/release/libethercrab_ffi.dylib dist/macos/libethercrab_ffi-x86_64.dylib
+          cp target/aarch64-apple-darwin/release/libethercrab_ffi.dylib dist/macos/libethercrab_ffi-aarch64.dylib
 
       - name: Upload macOS binaries
         uses: actions/upload-artifact@v4
@@ -66,15 +64,23 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Install Npcap SDK
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $npcapUrl = "https://npcap.com/dist/npcap-sdk-1.13.zip"
+          Invoke-WebRequest -Uri $npcapUrl -OutFile npcap-sdk.zip
+          Expand-Archive -Path npcap-sdk.zip -DestinationPath C:\npcapsdk -Force
+          echo "LIB=C:\npcapsdk\Lib\x64;$env:LIB" >> $env:GITHUB_ENV
+
       - name: Build Windows x86_64
         run: |
-          cd ethercrab_ffi
-          cargo build --release --target x86_64-pc-windows-msvc
+          cargo build -p ethercrab_ffi --release --target x86_64-pc-windows-msvc
 
       - name: Prepare Windows binary
         run: |
           mkdir -p dist/windows
-          cp ethercrab_ffi/target/x86_64-pc-windows-msvc/release/ethercrab_ffi.dll dist/windows/libethercrab_ffi.dll
+          cp target/x86_64-pc-windows-msvc/release/ethercrab_ffi.dll dist/windows/libethercrab_ffi.dll
 
       - name: Upload Windows binary
         uses: actions/upload-artifact@v4
@@ -104,19 +110,17 @@ jobs:
 
       - name: Build Linux x86_64
         run: |
-          cd ethercrab_ffi
-          cargo build --release --target x86_64-unknown-linux-gnu
+          cargo build -p ethercrab_ffi --release --target x86_64-unknown-linux-gnu
 
       - name: Build Linux ARM64
         run: |
-          cd ethercrab_ffi
-          cargo build --release --target aarch64-unknown-linux-gnu
+          cargo build -p ethercrab_ffi --release --target aarch64-unknown-linux-gnu
 
       - name: Prepare Linux binaries
         run: |
           mkdir -p dist/linux
-          cp ethercrab_ffi/target/x86_64-unknown-linux-gnu/release/libethercrab_ffi.so dist/linux/libethercrab_ffi-x86_64.so
-          cp ethercrab_ffi/target/aarch64-unknown-linux-gnu/release/libethercrab_ffi.so dist/linux/libethercrab_ffi-aarch64.so
+          cp target/x86_64-unknown-linux-gnu/release/libethercrab_ffi.so dist/linux/libethercrab_ffi-x86_64.so
+          cp target/aarch64-unknown-linux-gnu/release/libethercrab_ffi.so dist/linux/libethercrab_ffi-aarch64.so
 
       - name: Upload Linux binaries
         uses: actions/upload-artifact@v4
