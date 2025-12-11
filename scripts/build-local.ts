@@ -2,7 +2,7 @@
 
 /**
  * Build script for local development.
- * Builds the Rust FFI library and copies it to lib/ with architecture-specific naming.
+ * Builds the Rust FFI library and copies it to jn-ec-master-lib/ with architecture-specific naming.
  */
 
 /**
@@ -86,7 +86,7 @@ async function main() {
   const targetFilename = getLibraryFilename();
 
   const sourcePath = `target/${buildDir}/${cargoOutput}`;
-  const targetPath = `lib/${targetFilename}`;
+  const targetPath = `jn-ec-master-lib/${targetFilename}`;
 
   // Check if source file exists
   try {
@@ -97,10 +97,10 @@ async function main() {
     );
   }
 
-  // Ensure lib/ directory exists
-  await Deno.mkdir("lib", { recursive: true });
+  // Ensure jn-ec-master-lib/ directory exists
+  await Deno.mkdir("jn-ec-master-lib", { recursive: true });
 
-  // Copy to lib/ with architecture-specific name
+  // Copy to jn-ec-master-lib/ with architecture-specific name
   console.log(`Copying ${sourcePath} → ${targetPath}...`);
   await Deno.copyFile(sourcePath, targetPath);
 
@@ -109,7 +109,7 @@ async function main() {
     await Deno.chmod(targetPath, 0o755);
   }
 
-  console.log(`✅ Successfully built and copied ${targetFilename} to lib/`);
+  console.log(`✅ Successfully built and copied ${targetFilename} to jn-ec-master-lib/`);
 }
 
 if (import.meta.main) {

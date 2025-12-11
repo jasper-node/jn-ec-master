@@ -16,13 +16,7 @@ ethercrab_ffi/target/
 # Build Artifacts (temporary build directory from CI/CD)
 # Note: libs/ directory is tracked and included in JSR package
 dist/
-# Ignore FFI binary files (but allow lib/ directory structure to be tracked)
-lib/libethercrab_ffi.dylib
-lib/libethercrab_ffi.so
-lib/libethercrab_ffi.dll
-lib/libethercrab_ffi*.dylib
-lib/libethercrab_ffi*.so
-lib/libethercrab_ffi*.dll
+jn-ec-master-lib/
 discovered.json
 
 # Deno Cache

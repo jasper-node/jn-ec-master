@@ -91,8 +91,22 @@ export class EcMaster extends EventEmitter {
    */
   private static openLibrary(): Deno.DynamicLibrary<typeof ethercrabSymbols> {
     const libFilename = getLibraryFilename();
-    const libPath = `lib/${libFilename}`;
+    const libPath = `jn-ec-master-lib/${libFilename}`;
     const dlPath = join(Deno.cwd(), libPath);
+
+    try {
+      Deno.statSync(dlPath);
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) {
+        throw new Error(
+          `EtherCAT library not found at ${dlPath}.\n` +
+            `Please run the following command to download the binaries:\n` +
+            `deno --allow-run --allow-net --allow-write --allow-read https://raw.githubusercontent.com/jasper-node/jn-ec-master/refs/heads/main/scripts/download-binaries.ts`,
+        );
+      }
+      throw error;
+    }
+
     return Deno.dlopen(dlPath, ethercrabSymbols);
   }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S deno run --allow-net --allow-write --allow-read --allow-env
 
 /**
- * Download FFI binaries from GitHub releases and install them to lib/ folder
+ * Download FFI binaries from GitHub releases and install them to jn-ec-master-lib/ folder
  *
  * Usage:
  *   deno run -A scripts/download-binaries.ts [version]
@@ -9,43 +9,6 @@
  * If version is not specified, downloads the latest release.
  * Version can be a tag name (e.g., "v1.0.0") or "latest"
  */
-
-// Auto-detect GitHub owner and repo from git remote, or use environment variables
-async function getGitHubInfo(): Promise<{ owner: string; repo: string }> {
-  // Check environment variables first
-  const envOwner = Deno.env.get("GITHUB_OWNER");
-  const envRepo = Deno.env.get("GITHUB_REPO");
-
-  if (envOwner && envRepo) {
-    return { owner: envOwner, repo: envRepo };
-  }
-
-  // Try to detect from git remote
-  try {
-    const command = new Deno.Command("git", {
-      args: ["remote", "get-url", "origin"],
-      stdout: "piped",
-      stderr: "piped",
-    });
-
-    const { code, stdout } = await command.output();
-    if (code === 0) {
-      const url = new TextDecoder().decode(stdout).trim();
-      // Match both SSH and HTTPS formats
-      const match = url.match(
-        /(?:git@github\.com:|https:\/\/github\.com\/)([^\/]+)\/([^\/\.]+)(?:\.git)?/,
-      );
-      if (match && match[1] && match[2]) {
-        return { owner: match[1], repo: match[2] };
-      }
-    }
-  } catch {
-    // Git command failed, fall through to default
-  }
-
-  // Default fallback (update these if needed)
-  return { owner: "jasper-node", repo: "jn-ec-master" };
-}
 
 interface GitHubRelease {
   tag_name: string;
@@ -114,7 +77,8 @@ async function main() {
 
   try {
     // Get GitHub owner and repo
-    const { owner, repo } = await getGitHubInfo();
+    const owner = "jasper-node";
+    const repo = "jn-ec-master";
     console.log(`Using repository: ${owner}/${repo}`);
 
     // Get release information
@@ -141,7 +105,7 @@ async function main() {
       await Deno.mkdir(extractDir, { recursive: true });
       await extractZip(zipPath, extractDir);
 
-      // Copy all platform binaries into lib/ (no renaming) so packages ship every target
+      // Copy all platform binaries into jn-ec-master-lib/ (no renaming) so packages ship every target
       const extractedFiles = [];
       for await (const entry of Deno.readDir(extractDir)) {
         if (entry.isFile && entry.name.startsWith("libethercrab_ffi")) {
@@ -153,11 +117,11 @@ async function main() {
         throw new Error("No libethercrab_ffi binaries found in extracted archive");
       }
 
-      await Deno.mkdir("lib", { recursive: true });
+      await Deno.mkdir("jn-ec-master-lib", { recursive: true });
 
       for (const filename of extractedFiles) {
         const sourcePath = `${extractDir}/${filename}`;
-        const targetPath = `lib/${filename}`;
+        const targetPath = `jn-ec-master-lib/${filename}`;
 
         await Deno.copyFile(sourcePath, targetPath);
 
@@ -169,7 +133,7 @@ async function main() {
         console.log(`Installed ${filename} → ${targetPath}`);
       }
 
-      console.log(`✅ Successfully installed all platform binaries to lib/`);
+      console.log(`✅ Successfully installed all platform binaries to jn-ec-master-lib/`);
       console.log(`   Release: ${release.tag_name}`);
     } finally {
       // Cleanup temporary directory
