@@ -1,5 +1,8 @@
 name: Build and Bundle Binaries
 
+permissions:
+  contents: write # required for softprops/action-gh-release to create releases
+
 on:
   # Trigger on version tags (for releases)
   push:
