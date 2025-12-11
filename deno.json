@@ -65,6 +65,7 @@
       "./README.md"
     ],
     "exclude": [
+      "./ethercrab/**/*",
       "./src/tests/",
       "./src/__specs__/",
       "./src/utils/__specs__/",
