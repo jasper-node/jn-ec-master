@@ -3,7 +3,8 @@
 .idea/
 
 # Project Files
-ethercrab/**/*
+# Ignore local checkout of upstream Ethercrab repo
+ethercrab/
 __old/
 tmp/
 
