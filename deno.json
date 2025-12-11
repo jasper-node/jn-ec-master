@@ -6,7 +6,7 @@
     "lint": "deno lint --ignore='**/*_test.ts,**/*.test.ts,**/tests/**'",
     "check": "deno check **/*.ts && deno fmt --check && deno task lint",
     "build": "deno task test:rust && deno task build:rust",
-    "build:rust": "cargo build -p ethercrab_ffi --release && cp target/release/libethercrab_ffi.dylib lib/libethercrab_ffi.dylib",
+    "build:rust": "deno run -A scripts/build-local.ts --release",
     "example:discover": "deno -A --unstable-ffi examples/discover.ts discovered.json $IF",
     "example:cycle": "IF=$IF deno task example:discover && sleep 3 && deno -A --unstable-ffi examples/cycle_eni_config.ts discovered.json $IF --fast",
     "test:ts": "deno test --allow-ffi --allow-read --allow-write --allow-env --unstable-ffi",

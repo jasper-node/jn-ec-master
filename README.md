@@ -317,7 +317,7 @@ Build binaries for all platforms using GitHub Actions:
 **Triggers:**
 
 - Automatic on version tags: `git tag v1.0.0 && git push origin v1.0.0`
-- Manual dispatch from GitHub Actions UI
+- Manual dispatch: Go to **Actions** → **Build and Bundle Binaries** → **Run workflow** (optional: provide version tag like `v1.0.0`)
 
 **Build jobs:**
 
@@ -386,15 +386,3 @@ through the use of this information or code.
 **Note on Safety:** This software is **not** intended for use in functional
 safety applications (e.g., SIL 3/4) unless used in conjunction with certified
 safety hardware (FSoE) and validated by a relevant authority.
-
-## TODO
-
-### Phase 5.5: Build & Distribution
-
-- [ ] Set up GitHub Actions workflow (`.github/workflows/build.yml`)
-- [ ] Test workflow with manual dispatch
-- [ ] Set up cross-compilation for all 5 target platforms
-- [ ] Build FFI libraries for: linuxA64, linux64, win64, mac64, macA64
-- [ ] Bundle compiled libraries with package
-- [ ] Implement runtime library selection based on platform
-- [ ] Test package publishing with bundled binaries

@@ -36,19 +36,39 @@ export { AlStatusCode, RegisterAddress, SlaveState };
 export type { EmergencyEvent, EniConfig, StateChangeEvent };
 
 /**
- * Get the platform-specific library extension.
- * @returns The library file extension for the current platform
+ * Get the platform and architecture-specific library filename.
+ * Matches the naming convention from GitHub Actions workflow build.yml.
+ * @returns The library filename for the current platform and architecture
  */
-function getLibraryExtension(): string {
-  switch (Deno.build.os) {
-    case "darwin":
-      return ".dylib";
-    case "linux":
-      return ".so";
-    case "windows":
-      return ".dll";
+function getLibraryFilename(): string {
+  const os = Deno.build.os;
+  const arch = Deno.build.arch;
+
+  switch (os) {
+    case "darwin": {
+      if (arch === "aarch64") {
+        return "libethercrab_ffi-aarch64.dylib";
+      } else if (arch === "x86_64") {
+        return "libethercrab_ffi-x86_64.dylib";
+      } else {
+        throw new Error(`Unsupported macOS architecture: ${arch}`);
+      }
+    }
+    case "linux": {
+      if (arch === "aarch64") {
+        return "libethercrab_ffi-aarch64.so";
+      } else if (arch === "x86_64") {
+        return "libethercrab_ffi-x86_64.so";
+      } else {
+        throw new Error(`Unsupported Linux architecture: ${arch}`);
+      }
+    }
+    case "windows": {
+      // Windows only supports x86_64
+      return "libethercrab_ffi.dll";
+    }
     default:
-      throw new Error(`Unsupported platform: ${Deno.build.os}`);
+      throw new Error(`Unsupported platform: ${os}`);
   }
 }
 
@@ -70,8 +90,8 @@ export class EcMaster extends EventEmitter {
    * @returns A Deno.DynamicLibrary instance for the ethercrab FFI symbols
    */
   private static openLibrary(): Deno.DynamicLibrary<typeof ethercrabSymbols> {
-    const libExtension = getLibraryExtension();
-    const libPath = `lib/libethercrab_ffi${libExtension}`;
+    const libFilename = getLibraryFilename();
+    const libPath = `lib/${libFilename}`;
     const dlPath = join(Deno.cwd(), libPath);
     return Deno.dlopen(dlPath, ethercrabSymbols);
   }
