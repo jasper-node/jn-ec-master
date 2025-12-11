@@ -1,4 +1,5 @@
 import { assertEquals, assertExists } from "@std/assert";
+import { assertSpyCall, spy, stub } from "@std/testing/mock";
 import { EcMaster } from "../ec_master.ts";
 import type { EniConfig } from "../types/eni-config.ts";
 import type { EmergencyEvent } from "../types/ec_types.ts";
@@ -389,4 +390,164 @@ Deno.test("startEmergencyPolling - handles multiple CoE slaves correctly", async
   // Clean up
   master.stopEmergencyPolling();
   master.close();
+});
+
+// --- Mocks & Stubs ---
+
+// 1. Mock ENI Configuration with one CoE slave
+const MOCK_ENI: EniConfig = {
+  master: { info: { name: "TestMaster" }, cycleTime: 10000, dcSupport: false },
+  interface: "test_interface",
+  processImage: { inputs: { byteSize: 0, variables: [] }, outputs: { byteSize: 0, variables: [] } },
+  slaves: [
+    {
+      vendorId: 0x00000002,
+      productCode: 0x12345678,
+      revisionNumber: 0x01,
+      serialNumber: 0,
+      name: "Slave_0",
+      physAddr: 1001,
+      autoIncAddr: 0,
+      // CRITICAL: These fields trigger the mailbox polling in EcMaster
+      mailboxStatusAddr: 0x080D,
+      pollTime: 20,
+      supportsCoE: true,
+    },
+  ],
+};
+
+// 2. Define the Mock FFI Symbols
+// We only need to mock the functions that EcMaster calls during initialization and polling
+const mockSymbols = {
+  ethercrab_init: () => 0,
+  ethercrab_get_pdi_total_size: () => 0,
+  ethercrab_get_pdi_buffer_ptr: () => Deno.UnsafePointer.create(0n), // Null pointer
+  ethercrab_configure_mailbox_polling: () => 0,
+  ethercrab_scan_free: () => {},
+  ethercrab_destroy: () => {},
+  // THE CORE TEST TARGET:
+  ethercrab_check_mailbox_resilient: (_idx: number, _addr: number, _lastToggle: number) => 0, // Default to empty
+  ethercrab_get_last_emergency: (_buf: Uint8Array) => 1, // Default: No emergency
+};
+
+// 3. Helper to create a Master with mocked FFI
+function createTestMaster() {
+  // Stub Deno.dlopen to return our mock symbols
+  const dlopenStub = stub(Deno, "dlopen", () => ({
+    symbols: mockSymbols,
+    close: () => {},
+  } as any));
+
+  // Stub Deno.statSync to bypass "library not found" check
+  const statStub = stub(Deno, "statSync", () => ({ isFile: true } as any));
+
+  const master = new EcMaster(MOCK_ENI);
+
+  return { master, dlopenStub, statStub };
+}
+
+// --- Tests ---
+
+Deno.test("Mailbox Resilience: Initialization State", async () => {
+  const { master, dlopenStub, statStub } = createTestMaster();
+
+  try {
+    // Override the resilient check to verify arguments
+    const checkSpy = spy(mockSymbols, "ethercrab_check_mailbox_resilient");
+
+    // Initialize (starts polling)
+    await master.initialize();
+
+    // Fast-forward time or wait for one poll cycle
+    // Since setInterval is used, we wait slightly longer than pollTime (20ms)
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    // Assert that the first call passed '2' as the lastToggleBit (Initial State)
+    assertSpyCall(checkSpy, 0, {
+      args: [
+        0, // Slave Index
+        0x080D, // Register Address
+        2, // Expected Initial Toggle State (2 = Unknown/First Run)
+      ],
+    });
+  } finally {
+    master.close();
+    dlopenStub.restore();
+    statStub.restore();
+    // Restore the spy on the mock object
+    (mockSymbols.ethercrab_check_mailbox_resilient as any).restore?.();
+  }
+});
+
+Deno.test("Mailbox Resilience: Successful Toggle Flip", async () => {
+  const { master, dlopenStub, statStub } = createTestMaster();
+
+  let callCount = 0;
+  const checkStub = stub(
+    mockSymbols,
+    "ethercrab_check_mailbox_resilient",
+    (_idx: number, _addr: number, _lastToggle: number) => {
+      callCount++;
+      // Always return 1 (Success/New Mail found)
+      return 1;
+    },
+  );
+
+  try {
+    // SCENARIO:
+    // 1. First poll returns 1 (New Mail). Master should update local toggle to 0.
+    // 2. Second poll returns 1 (New Mail). Master should pass 0, see success, update to 1.
+
+    await master.initialize();
+
+    // Wait for 3 cycles (approx 60ms)
+    await new Promise((resolve) => setTimeout(resolve, 70));
+
+    // VERIFICATION:
+
+    // Call 1: Initial state. Passed 2. Returns 1.
+    // Master logic: (2 === 0) ? 1 : 0 => New Toggle is 0.
+    assertSpyCall(checkStub, 0, { args: [0, 0x080D, 2] });
+
+    // Call 2: Master should pass 0 (the new state). Returns 1.
+    // Master logic: (0 === 0) ? 1 : 0 => New Toggle is 1.
+    assertSpyCall(checkStub, 1, { args: [0, 0x080D, 0] });
+
+    // Call 3: Master should pass 1. Returns 1.
+    // Master logic: (1 === 0) ? 1 : 0 => New Toggle is 0.
+    assertSpyCall(checkStub, 2, { args: [0, 0x080D, 1] });
+  } finally {
+    master.close();
+    dlopenStub.restore();
+    statStub.restore();
+    checkStub.restore();
+  }
+});
+
+Deno.test("Mailbox Resilience: Retry Failure Handling", async () => {
+  const { master, dlopenStub, statStub } = createTestMaster();
+  const checkStub = stub(mockSymbols, "ethercrab_check_mailbox_resilient", () => -2);
+
+  try {
+    // SCENARIO: Rust returns -2 (Retry Limit Exceeded).
+    // Expectation: Master emits 'mailboxError'.
+
+    // Setup Event Spy
+    let errorEmitted = false;
+    master.on("mailboxError", (evt) => {
+      errorEmitted = true;
+      assertEquals(evt.slaveIndex, 0);
+      assertEquals(evt.error, "Resilient read failed after retries");
+    });
+
+    await master.initialize();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    assertEquals(errorEmitted, true, "Should emit mailboxError when Rust returns -2");
+  } finally {
+    master.close();
+    dlopenStub.restore();
+    statStub.restore();
+    checkStub.restore();
+  }
 });
