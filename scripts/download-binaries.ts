@@ -77,48 +77,6 @@ async function getRelease(
   return await response.json();
 }
 
-function getPlatformBinaryName(): { source: string; target: string } {
-  const os = Deno.build.os;
-  const arch = Deno.build.arch;
-
-  let sourceName: string;
-  let targetName: string;
-
-  switch (os) {
-    case "darwin": {
-      targetName = "libethercrab_ffi.dylib";
-      if (arch === "aarch64") {
-        sourceName = "libethercrab_ffi-aarch64.dylib";
-      } else if (arch === "x86_64") {
-        sourceName = "libethercrab_ffi-x86_64.dylib";
-      } else {
-        throw new Error(`Unsupported macOS architecture: ${arch}`);
-      }
-      break;
-    }
-    case "linux": {
-      targetName = "libethercrab_ffi.so";
-      if (arch === "aarch64") {
-        sourceName = "libethercrab_ffi-aarch64.so";
-      } else if (arch === "x86_64") {
-        sourceName = "libethercrab_ffi-x86_64.so";
-      } else {
-        throw new Error(`Unsupported Linux architecture: ${arch}`);
-      }
-      break;
-    }
-    case "windows": {
-      sourceName = "libethercrab_ffi.dll";
-      targetName = "libethercrab_ffi.dll";
-      break;
-    }
-    default:
-      throw new Error(`Unsupported platform: ${os}`);
-  }
-
-  return { source: sourceName, target: targetName };
-}
-
 async function downloadFile(url: string, dest: string): Promise<void> {
   console.log(`Downloading ${url}...`);
   const response = await fetch(url);
@@ -127,9 +85,9 @@ async function downloadFile(url: string, dest: string): Promise<void> {
     throw new Error(`Failed to download file: ${response.statusText}`);
   }
 
-  const file = await Deno.open(dest, { create: true, write: true, truncate: true });
-  await response.body?.pipeTo(file.writable);
-  file.close();
+  // Streamless write avoids double-close "Bad resource ID" errors on some Deno versions
+  const data = new Uint8Array(await response.arrayBuffer());
+  await Deno.writeFile(dest, data);
 }
 
 async function extractZip(zipPath: string, extractTo: string): Promise<void> {
@@ -183,39 +141,36 @@ async function main() {
       await Deno.mkdir(extractDir, { recursive: true });
       await extractZip(zipPath, extractDir);
 
-      // Get platform-specific binary names
-      const { source, target } = getPlatformBinaryName();
-      const sourcePath = `${extractDir}/${source}`;
-      const targetPath = `lib/${target}`;
-
-      // Check if source binary exists
-      try {
-        await Deno.stat(sourcePath);
-      } catch {
-        throw new Error(
-          `Binary not found in release: ${source}\nAvailable files: ${
-            (await Array.fromAsync(Deno.readDir(extractDir)))
-              .map((f) => f.name)
-              .join(", ")
-          }`,
-        );
+      // Copy all platform binaries into lib/ (no renaming) so packages ship every target
+      const extractedFiles = [];
+      for await (const entry of Deno.readDir(extractDir)) {
+        if (entry.isFile && entry.name.startsWith("libethercrab_ffi")) {
+          extractedFiles.push(entry.name);
+        }
       }
 
-      // Ensure lib/ directory exists
+      if (extractedFiles.length === 0) {
+        throw new Error("No libethercrab_ffi binaries found in extracted archive");
+      }
+
       await Deno.mkdir("lib", { recursive: true });
 
-      // Copy binary to lib/ folder, overwriting if exists
-      console.log(`Installing ${source} → ${targetPath}...`);
-      await Deno.copyFile(sourcePath, targetPath);
+      for (const filename of extractedFiles) {
+        const sourcePath = `${extractDir}/${filename}`;
+        const targetPath = `lib/${filename}`;
 
-      // Make executable on Unix systems
-      if (Deno.build.os !== "windows") {
-        await Deno.chmod(targetPath, 0o755);
+        await Deno.copyFile(sourcePath, targetPath);
+
+        // Make executable on non-Windows platforms
+        if (!filename.endsWith(".dll")) {
+          await Deno.chmod(targetPath, 0o755);
+        }
+
+        console.log(`Installed ${filename} → ${targetPath}`);
       }
 
-      console.log(`✅ Successfully installed ${target} to lib/ folder`);
+      console.log(`✅ Successfully installed all platform binaries to lib/`);
       console.log(`   Release: ${release.tag_name}`);
-      console.log(`   Binary: ${source} → ${target}`);
     } finally {
       // Cleanup temporary directory
       await Deno.remove(tempDir, { recursive: true });
