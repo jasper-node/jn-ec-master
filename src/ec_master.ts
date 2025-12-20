@@ -102,7 +102,7 @@ export class EcMaster extends EventEmitter {
         throw new Error(
           `EtherCAT library not found at ${dlPath}.\n` +
             `Please run the following command to download the binaries:\n` +
-            `deno --allow-run --allow-net --allow-write --allow-read run jsr:@controlx-io/jn-ec-master/scripts/download-binaries.ts`,
+            `deno run --allow-run --allow-net --allow-write --allow-read jsr:@controlx-io/jn-ec-master/scripts/download-binaries.ts`,
         );
       }
       throw error;
