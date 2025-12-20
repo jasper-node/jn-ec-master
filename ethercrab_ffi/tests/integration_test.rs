@@ -79,6 +79,9 @@ fn setup_hardware() -> bool {
         0,
         std::ptr::null(),
         0,
+        100,   // pdu_timeout_ms
+        5000,  // state_transition_timeout_ms
+        1000,  // mailbox_response_timeout_ms
     );
     
     result == 0

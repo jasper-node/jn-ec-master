@@ -26,6 +26,15 @@ export interface EniConfig {
      * Example: If cycleTime is 1000000 (1s), set watchdogTimeoutMs to at least 2000 (2s).
      */
     watchdogTimeoutMs?: number;
+
+    /**
+     * Non-standard runtime options for the wrapper (not part of ENI spec).
+     */
+    runtimeOptions?: {
+      pduTimeoutMs?: number;
+      stateTransitionTimeoutMs?: number;
+      mailboxResponseTimeoutMs?: number;
+    };
   };
 
   // Network interface (not in ENI, but required for execution)

@@ -14,6 +14,9 @@ export const ethercrabSymbols = {
       "usize", // expected_count: usize
       "buffer", // init_commands: *const FfiInitCommand
       "usize", // init_command_count: usize
+      "u64", // pdu_timeout_ms
+      "u64", // state_transition_timeout_ms
+      "u64", // mailbox_response_timeout_ms
     ],
     result: "i32",
     nonblocking: true, // Async: Network I/O (Init sequence)

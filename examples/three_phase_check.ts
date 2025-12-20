@@ -5,6 +5,7 @@ import { PdoMapping } from "../src/types/ec_types.ts";
 
 async function demonstrateThreePhaseWorkflow() {
   const ifname = Deno.args[0] || "eth0";
+  const duration = Deno.args[1] ? parseInt(Deno.args[1], 10) : 30000;
 
   console.log(`Discovering network on ${ifname}...`);
   const config = await EcMaster.discoverNetwork(ifname);
@@ -136,7 +137,7 @@ async function demonstrateThreePhaseWorkflow() {
     if (hasEL1809) console.log("  ✓ EL1809 (Digital Input) found");
     if (hasEL3062) console.log("  ✓ EL3062 (Analog Input) found");
 
-    console.log("\nCyclic Operation Demo (30 seconds):");
+    console.log(`\nCyclic Operation Demo (${duration / 1000} seconds):`);
     console.log("===================================");
 
     const startTime = Date.now();
@@ -198,7 +199,6 @@ async function demonstrateThreePhaseWorkflow() {
       }
     }, cycleTimeMs);
 
-    const duration = 30000;
     setTimeout(async () => {
       clearInterval(intervalId);
       console.log(`\n✓ Cyclic operation completed (${cycleCount} cycles)`);

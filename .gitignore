@@ -16,7 +16,7 @@ ethercrab_ffi/target/
 # Build Artifacts (temporary build directory from CI/CD)
 # Note: libs/ directory is tracked and included in JSR package
 dist/
-jn-ec-master-lib/
+lib-jn-ec-master/
 discovered.json
 
 # Deno Cache

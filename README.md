@@ -10,6 +10,9 @@ Node.js runtimes.
 
 ```bash
 deno add jsr:@controlx-io/jn-ec-master
+# the binaries are NOT included in the packaged
+# run the following command to donwload it to ./lib-jn-ec-master
+deno --allow-run --allow-net --allow-write --allow-read run jsr:@controlx-io/jn-ec-master/scripts/download-binaries.ts
 ```
 
 ## Pre-compiled Binaries
@@ -209,10 +212,13 @@ deno -A --unstable-ffi examples/three_phase_check.ts eth0
 1. Ensure you have Rust installed (`rustup`).
 2. Ensure you have Deno installed.
 3. Build the FFI library:
-   ```bash
-   git clone https://github.com/alex-controlx/ethercrab.git
-   deno task build
-   ```
+
+```bash
+git clone https://github.com/alex-controlx/ethercrab.git
+deno task build
+# add Linux permissions for development
+sudo setcap 'cap_net_raw,cap_net_admin=eip' $(which deno)
+```
 
 ### Running Tests
 

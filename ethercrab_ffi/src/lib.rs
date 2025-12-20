@@ -1,5 +1,6 @@
 use std::ffi::{CStr, c_char, c_int};
 use std::sync::Arc;
+use std::time::Duration;
 use ethercrab::{
     MainDevice, MainDeviceConfig, PduStorage, Timeouts, std::ethercat_now,
     subdevice_group::{PreOp, SafeOp, Op},
@@ -212,6 +213,9 @@ pub extern "C" fn ethercrab_init(
     _expected_count: usize,
     init_commands: *const FfiInitCommand,
     init_command_count: usize,
+    pdu_timeout_ms: u64,
+    state_transition_timeout_ms: u64,
+    mailbox_response_timeout_ms: u64,
 ) -> c_int {
     if interface.is_null() { return -1; }
 
@@ -231,6 +235,17 @@ pub extern "C" fn ethercrab_init(
         Vec::new()
     };
 
+    // Build custom Timeouts from parameters
+    let timeouts = Timeouts {
+        pdu: Duration::from_millis(pdu_timeout_ms),
+        state_transition: Duration::from_millis(state_transition_timeout_ms),
+        mailbox_response: Duration::from_millis(mailbox_response_timeout_ms),
+        // Keep other timeouts at defaults
+        eeprom: Duration::from_millis(10),
+        wait_loop_delay: Duration::from_millis(0),
+        mailbox_echo: Duration::from_millis(100),
+    };
+
     // Run purely on this thread. smol::block_on spins a local executor.
     let result = smol::block_on(async move {
         let maindevice = match GLOBAL_DEVICE.get() {
@@ -243,7 +258,7 @@ pub extern "C" fn ethercrab_init(
                 
                 let maindevice = Arc::new(MainDevice::new(
                     pdu_loop,
-                    Timeouts::default(),
+                    timeouts,
                     MainDeviceConfig {
                         dc_static_sync_iterations: 0,  // Disable DC to avoid timeouts
                         ..MainDeviceConfig::default()

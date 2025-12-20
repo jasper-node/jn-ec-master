@@ -31,6 +31,9 @@ fn setup_master() -> CString {
         1,
         ptr::null(),
         0,
+        100,   // pdu_timeout_ms
+        5000,  // state_transition_timeout_ms
+        1000,  // mailbox_response_timeout_ms
     );
     assert_eq!(result, 0);
     interface

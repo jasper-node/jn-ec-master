@@ -73,6 +73,7 @@ function getLibraryFilename(): string {
 }
 
 export class EcMaster extends EventEmitter {
+  static defaultDirPath: string = "lib-jn-ec-master";
   private dl: Deno.DynamicLibrary<typeof ethercrabSymbols>;
   private pdiBuffer: Uint8Array | null = null;
   private pdiView: DataView | null = null;
@@ -89,9 +90,9 @@ export class EcMaster extends EventEmitter {
    * Open the platform-specific dynamic library.
    * @returns A Deno.DynamicLibrary instance for the ethercrab FFI symbols
    */
-  private static openLibrary(): Deno.DynamicLibrary<typeof ethercrabSymbols> {
+  private static openLibrary(dirPath: string): Deno.DynamicLibrary<typeof ethercrabSymbols> {
     const libFilename = getLibraryFilename();
-    const libPath = `jn-ec-master-lib/${libFilename}`;
+    const libPath = dirPath + "/" + libFilename;
     const dlPath = join(Deno.cwd(), libPath);
 
     try {
@@ -101,7 +102,7 @@ export class EcMaster extends EventEmitter {
         throw new Error(
           `EtherCAT library not found at ${dlPath}.\n` +
             `Please run the following command to download the binaries:\n` +
-            `deno --allow-run --allow-net --allow-write --allow-read https://raw.githubusercontent.com/jasper-node/jn-ec-master/refs/heads/main/scripts/download-binaries.ts`,
+            `deno --allow-run --allow-net --allow-write --allow-read run jsr:@controlx-io/jn-ec-master/scripts/download-binaries.ts`,
         );
       }
       throw error;
@@ -110,23 +111,23 @@ export class EcMaster extends EventEmitter {
     return Deno.dlopen(dlPath, ethercrabSymbols);
   }
 
-  constructor(eniConfig: EniConfig) {
+  constructor(eniConfig: EniConfig, dirPath?: string) {
     super();
 
     this.eniConfig = eniConfig;
-    this.dl = EcMaster.openLibrary();
+    this.dl = EcMaster.openLibrary(dirPath || EcMaster.defaultDirPath);
   }
 
   /**
    * Discovery Mode: Scan network and generate EniConfig
    */
-  static async discoverNetwork(interfaceName: string): Promise<EniConfig> {
+  static async discoverNetwork(interfaceName: string, dirPath?: string): Promise<EniConfig> {
     // Retry configuration constants
     const MAX_SCAN_RETRIES = 5;
     const BASE_RETRY_DELAY_MS = 50;
     const MAX_RETRY_DELAY_MS = 500;
 
-    const dl = EcMaster.openLibrary();
+    const dl = EcMaster.openLibrary(dirPath || EcMaster.defaultDirPath);
 
     try {
       // [Step 1] PROACTIVE CLEANUP: Ensure any previous state is cleared
@@ -656,6 +657,12 @@ export class EcMaster extends EventEmitter {
     const interfaceName = this.eniConfig.interface;
     const interfaceNameBuffer = new TextEncoder().encode(interfaceName + "\0");
 
+    // Get timeout values from runtimeOptions with safe defaults
+    const runtimeOpts = this.eniConfig.master.runtimeOptions || {};
+    const pduTimeoutMs = runtimeOpts.pduTimeoutMs ?? 100; // Default: 100ms (increased from 30ms)
+    const stateTransitionTimeoutMs = runtimeOpts.stateTransitionTimeoutMs ?? 5000; // Default: 5000ms
+    const mailboxResponseTimeoutMs = runtimeOpts.mailboxResponseTimeoutMs ?? 1000; // Default: 1000ms
+
     // 1. Initialize ethercrab
     const result = await this.dl.symbols.ethercrab_init(
       interfaceNameBuffer,
@@ -663,6 +670,9 @@ export class EcMaster extends EventEmitter {
       BigInt(0), // expected_count
       initCmdsBuffer,
       BigInt(initCmdsCount),
+      BigInt(pduTimeoutMs),
+      BigInt(stateTransitionTimeoutMs),
+      BigInt(mailboxResponseTimeoutMs),
     );
 
     if (result < 0) {

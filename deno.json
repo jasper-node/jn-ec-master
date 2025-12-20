@@ -1,6 +1,6 @@
 {
   "name": "@controlx-io/jn-ec-master",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "A TypeScript/Deno wrapper for the ethercrab Rust library, implementing EtherCAT Master Class B features.",
   "tasks": {
     "lint": "deno lint --ignore='**/*_test.ts,**/*.test.ts,**/tests/**'",
@@ -16,7 +16,14 @@
     "download-binaries": "deno run -A scripts/download-binaries.ts"
   },
   "compilerOptions": {
-    "lib": ["deno.unstable", "deno.ns", "dom"],
+    "lib": [
+      "deno.unstable",
+      "deno.ns",
+      "dom"
+    ],
+    "types": [
+      "npm:@types/node"
+    ],
     "strict": true,
     "noImplicitAny": true,
     "strictNullChecks": true,
@@ -34,7 +41,9 @@
   },
   "lint": {
     "rules": {
-      "tags": ["recommended"]
+      "tags": [
+        "recommended"
+      ]
     }
   },
   "fmt": {
@@ -62,7 +71,7 @@
     "include": [
       "./mod.ts",
       "./src/",
-      "./lib/",
+      "./scripts/download-binaries.ts",
       "./README.md"
     ],
     "exclude": [

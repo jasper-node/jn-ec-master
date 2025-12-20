@@ -1,7 +1,7 @@
 #!/usr/bin/env -S deno run --allow-net --allow-write --allow-read --allow-env
 
 /**
- * Download FFI binaries from GitHub releases and install them to jn-ec-master-lib/ folder
+ * Download FFI binaries from GitHub releases and install them to lib-jn-ec-master/ folder
  *
  * Usage:
  *   deno run -A scripts/download-binaries.ts [version]
@@ -105,7 +105,7 @@ async function main() {
       await Deno.mkdir(extractDir, { recursive: true });
       await extractZip(zipPath, extractDir);
 
-      // Copy all platform binaries into jn-ec-master-lib/ (no renaming) so packages ship every target
+      // Copy all platform binaries into lib-jn-ec-master/ (no renaming) so packages ship every target
       const extractedFiles = [];
       for await (const entry of Deno.readDir(extractDir)) {
         if (entry.isFile && entry.name.startsWith("libethercrab_ffi")) {
@@ -117,11 +117,11 @@ async function main() {
         throw new Error("No libethercrab_ffi binaries found in extracted archive");
       }
 
-      await Deno.mkdir("jn-ec-master-lib", { recursive: true });
+      await Deno.mkdir("lib-jn-ec-master", { recursive: true });
 
       for (const filename of extractedFiles) {
         const sourcePath = `${extractDir}/${filename}`;
-        const targetPath = `jn-ec-master-lib/${filename}`;
+        const targetPath = `lib-jn-ec-master/${filename}`;
 
         await Deno.copyFile(sourcePath, targetPath);
 
@@ -133,7 +133,7 @@ async function main() {
         console.log(`Installed ${filename} → ${targetPath}`);
       }
 
-      console.log(`✅ Successfully installed all platform binaries to jn-ec-master-lib/`);
+      console.log(`✅ Successfully installed all platform binaries to lib-jn-ec-master/`);
       console.log(`   Release: ${release.tag_name}`);
     } finally {
       // Cleanup temporary directory
