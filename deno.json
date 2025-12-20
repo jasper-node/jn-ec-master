@@ -65,7 +65,8 @@
   },
   "exports": {
     ".": "./mod.ts",
-    "./cycle-loop": "./src/utils/cycle-loop.ts"
+    "./cycle-loop": "./src/utils/cycle-loop.ts",
+    "./scripts/download-binaries": "./scripts/download-binaries.ts"
   },
   "publish": {
     "include": [
