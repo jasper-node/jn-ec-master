@@ -9,7 +9,7 @@
  */
 import { EniConfig } from "../src/types/eni-config.ts";
 import { EcMaster, SlaveState } from "../src/ec_master.ts";
-import { createCycleLoop } from "../src/utils/cycle-loop.ts";
+import { createCycleLoop } from "@controlx-io/cycle-loop";
 import { PdoMapping } from "../src/types/ec_types.ts";
 
 // Parse arguments: first arg can be ENI file path or interface name
@@ -182,7 +182,7 @@ function useBuffer(
 
 // Create cycle loop
 const cycleController = createCycleLoop({
-  cycleTimeUs: config.master.cycleTime || 10000, // Default to 10ms if not set
+  cycleTimeMs: (config.master.cycleTime || 10000) / 1000, // Convert from microseconds to milliseconds
   cycleFn: async () => {
     // Run the cycle and return WKC
     const wkc = await master.runCycle();

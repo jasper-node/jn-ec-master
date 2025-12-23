@@ -19,5 +19,3 @@ export { loadEniFromXml, parseEniJson } from "./src/utils/eni-loader.ts";
 export type { EniSlaveConfig, ProcessDataEntry, ProcessVariable } from "./src/types/eni-config.ts";
 
 export type { PdoMapping } from "./src/types/ec_types.ts";
-export type { CycleLoopController, CycleLoopOptions, CycleStats } from "./src/utils/cycle-loop.ts";
-export { createCycleLoop } from "./src/utils/cycle-loop.ts";
