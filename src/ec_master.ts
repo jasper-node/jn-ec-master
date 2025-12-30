@@ -73,7 +73,7 @@ function getLibraryFilename(): string {
 }
 
 export class EcMaster extends EventEmitter {
-  static defaultDirPath: string = "lib-jn-ec-master";
+  static defaultDirPath: string = join(Deno.cwd(), "lib-jn-ec-master");
   private dl: Deno.DynamicLibrary<typeof ethercrabSymbols>;
   private pdiBuffer: Uint8Array | null = null;
   private pdiView: DataView | null = null;
@@ -92,15 +92,14 @@ export class EcMaster extends EventEmitter {
    */
   private static openLibrary(dirPath: string): Deno.DynamicLibrary<typeof ethercrabSymbols> {
     const libFilename = getLibraryFilename();
-    const libPath = dirPath + "/" + libFilename;
-    const dlPath = join(Deno.cwd(), libPath);
+    const libPath = join(dirPath, libFilename);
 
     try {
-      Deno.statSync(dlPath);
+      Deno.statSync(libPath);
     } catch (error) {
       if (error instanceof Deno.errors.NotFound) {
         throw new Error(
-          `EtherCAT library not found at ${dlPath}.\n` +
+          `EtherCAT library not found at ${libPath}.\n` +
             `Please run the following command to download the binaries:\n` +
             `deno run --allow-run --allow-net --allow-write --allow-read jsr:@controlx-io/jn-ec-master/scripts/download-binaries.ts`,
         );
@@ -108,7 +107,7 @@ export class EcMaster extends EventEmitter {
       throw error;
     }
 
-    return Deno.dlopen(dlPath, ethercrabSymbols);
+    return Deno.dlopen(libPath, ethercrabSymbols);
   }
 
   constructor(eniConfig: EniConfig, dirPath?: string) {
