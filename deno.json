@@ -1,6 +1,6 @@
 {
   "name": "@controlx-io/jn-ec-master",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "A TypeScript/Deno wrapper for the ethercrab Rust library, implementing EtherCAT Master Class B features.",
   "tasks": {
     "lint": "deno lint --ignore='**/*_test.ts,**/*.test.ts,**/tests/**'",
