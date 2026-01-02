@@ -11,9 +11,28 @@ Node.js runtimes.
 ```bash
 deno add jsr:@controlx-io/jn-ec-master
 # the binaries are NOT included in the packaged
-# run the following command to donwload it to ./lib-jn-ec-master
+# run the following command to download it to ./lib-jn-ec-master
 deno run --allow-run --allow-net --allow-write --allow-read jsr:@controlx-io/jn-ec-master/scripts/download-binaries.ts
 ```
+
+## Target Applications
+
+This library is designed to use for **Discrete Automation**, **Process Control**, and the majority of **General Industrial Automation** applications.
+
+### What Amount of Applications Require This Speed?
+
+While marketing materials often hype "microsecond speeds," the reality of the industrial install base is quite different.
+
+| Application Tier                  | Strict Determinism?     | To use? | Examples                                                          |
+| :-------------------------------- | :---------------------- | :-----: | :---------------------------------------------------------------- |
+| **Tier 1: Motion & Safety**       | **CRITICAL** (<1 ms)    |   ❌    | Robotics, CNC, High-speed packaging, Printing, Optical sorting.   |
+| **Tier 2: Discrete Automation**   | **IMPORTANT** (5–20 ms) |   🟠    | Bottling lines, Conveyors, Assembly stations, Palletizing.        |
+| **Tier 3: Process Control**       | **LOW** (>50 ms)        |   ✅    | Water treatment, HVAC, Chemical mixing, Oil & Gas monitoring.     |
+| **General Industrial & Building** | **VERY LOW** (>500 ms)  |   ✅    | Lighting control, Energy monitoring, HVAC status, Access control. |
+
+**Summary:** Only about **15–20%** of industrial applications (Tier 1) strictly _require_ hard real-time determinism where a 10 ms drift would cause failure. The vast majority (~80%) would continue to run with a 15 ms drift, though Tier 2 applications might suffer from reduced efficiency or throughput.
+
+**WHILE IT IS PRODUCTION READY, DO YOUR RESEARCH BEFORE USING THIS PACKAGE**
 
 ## Pre-compiled Binaries
 
