@@ -303,6 +303,7 @@ export async function parseEniXml(xmlPath: string): Promise<EniConfig> {
     dcSupport: typeof masterXml?.DcSupport === "string"
       ? masterXml.DcSupport.toLowerCase() === "true"
       : Boolean(masterXml?.DcSupport),
+    runtimeOptions: { networkInterface: "eth0" },
   };
 
   const slaves: EniSlaveConfig[] = [];
@@ -608,7 +609,6 @@ export async function parseEniXml(xmlPath: string): Promise<EniConfig> {
   // Build EniConfig first (without mappings for standard format)
   const eniConfigPreMapping: EniConfig = {
     master,
-    interface: "",
     slaves,
     cyclic: cyclicConfig,
     processImage,

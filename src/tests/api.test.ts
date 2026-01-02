@@ -78,8 +78,7 @@ function teardownMocks() {
 }
 
 const validConfig: EniConfig = {
-  master: { cycleTime: 1000 },
-  interface: "test-iface",
+  master: { cycleTime: 1000, runtimeOptions: { networkInterface: "test-iface" } },
   slaves: [
     {
       name: "Slave1",

@@ -13,6 +13,9 @@ export async function parseEniJson(path: string): Promise<EniConfig> {
   if (!config.master || !config.slaves) {
     throw new Error("Invalid ENI JSON: Missing master or slaves configuration");
   }
+  if (typeof config.master.runtimeOptions !== "object") {
+    config.master.runtimeOptions = { networkInterface: "eth0" };
+  }
   return config;
 }
 

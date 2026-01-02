@@ -13,8 +13,7 @@ import type { EmergencyEvent } from "../types/ec_types.ts";
  */
 Deno.test("startEmergencyPolling - calls stopEmergencyPolling first", async () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "CoESlave",
@@ -49,8 +48,7 @@ Deno.test("startEmergencyPolling - calls stopEmergencyPolling first", async () =
 
 Deno.test("startEmergencyPolling - returns early when no CoE slaves exist", async () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "NonCoESlave",
@@ -78,8 +76,7 @@ Deno.test("startEmergencyPolling - returns early when no CoE slaves exist", asyn
 
 Deno.test("startEmergencyPolling - sets up interval when CoE slaves exist", async () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "CoESlave1",
@@ -108,8 +105,7 @@ Deno.test("startEmergencyPolling - sets up interval when CoE slaves exist", asyn
 
 Deno.test("startEmergencyPolling - clears existing interval before starting new one", async () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "CoESlave",
@@ -141,8 +137,7 @@ Deno.test("startEmergencyPolling - clears existing interval before starting new 
 
 Deno.test("startEmergencyPolling - emits emergency event for CoE-enabled slave", async () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "CoESlave",
@@ -188,8 +183,7 @@ Deno.test("startEmergencyPolling - emits emergency event for CoE-enabled slave",
 
 Deno.test("startEmergencyPolling - does NOT emit emergency event for non-CoE slave", async () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "CoESlave",
@@ -234,8 +228,7 @@ Deno.test("startEmergencyPolling - does NOT emit emergency event for non-CoE sla
 
 Deno.test("startEmergencyPolling - does NOT emit duplicate emergency events", async () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "CoESlave",
@@ -277,8 +270,7 @@ Deno.test("startEmergencyPolling - does NOT emit duplicate emergency events", as
 
 Deno.test("startEmergencyPolling - emits new emergency from same CoE slave when error changes", async () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "CoESlave",
@@ -334,8 +326,7 @@ Deno.test("startEmergencyPolling - emits new emergency from same CoE slave when 
 
 Deno.test("startEmergencyPolling - handles multiple CoE slaves correctly", async () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "CoESlave1",
@@ -396,8 +387,12 @@ Deno.test("startEmergencyPolling - handles multiple CoE slaves correctly", async
 
 // 1. Mock ENI Configuration with one CoE slave
 const MOCK_ENI: EniConfig = {
-  master: { info: { name: "TestMaster" }, cycleTime: 10000, dcSupport: false },
-  interface: "test_interface",
+  master: {
+    info: { name: "TestMaster" },
+    cycleTime: 10000,
+    dcSupport: false,
+    runtimeOptions: { networkInterface: "test_interface" },
+  },
   processImage: { inputs: { byteSize: 0, variables: [] }, outputs: { byteSize: 0, variables: [] } },
   slaves: [
     {

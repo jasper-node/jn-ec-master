@@ -41,7 +41,7 @@ Deno.test("parseEniXml - parses minimal valid XML", async () => {
     assertExists(config);
     assertEquals(config.master.cycleTime, 1000);
     assertEquals(config.slaves.length, 0);
-    assertEquals(config.interface, "");
+    assertEquals(config.master.runtimeOptions.networkInterface, "eth0");
   } finally {
     await Deno.remove(path);
   }

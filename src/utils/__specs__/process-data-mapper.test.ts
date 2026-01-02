@@ -4,8 +4,7 @@ import type { EniConfig } from "../../types/eni-config.ts";
 
 Deno.test("buildProcessDataMappings - returns empty map when processImage is missing", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [],
   };
 
@@ -15,8 +14,7 @@ Deno.test("buildProcessDataMappings - returns empty map when processImage is mis
 
 Deno.test("buildProcessDataMappings - returns empty map when processImage has no variables", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -40,8 +38,7 @@ Deno.test("buildProcessDataMappings - returns empty map when processImage has no
 
 Deno.test("buildProcessDataMappings - maps single output variable correctly", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -82,8 +79,7 @@ Deno.test("buildProcessDataMappings - maps single output variable correctly", ()
 
 Deno.test("buildProcessDataMappings - maps single input variable correctly", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -124,8 +120,7 @@ Deno.test("buildProcessDataMappings - maps single input variable correctly", () 
 
 Deno.test("buildProcessDataMappings - handles BOOL type with bitOffset", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -163,8 +158,7 @@ Deno.test("buildProcessDataMappings - handles BOOL type with bitOffset", () => {
 
 Deno.test("buildProcessDataMappings - handles BOOL at byte boundary", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -199,8 +193,7 @@ Deno.test("buildProcessDataMappings - handles BOOL at byte boundary", () => {
 
 Deno.test("buildProcessDataMappings - maps multiple variables from same slave", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -241,8 +234,7 @@ Deno.test("buildProcessDataMappings - maps multiple variables from same slave", 
 
 Deno.test("buildProcessDataMappings - maps variables from multiple slaves", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -307,8 +299,7 @@ Deno.test("buildProcessDataMappings - maps variables from multiple slaves", () =
 
 Deno.test("buildProcessDataMappings - handles gaps in bit ranges", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -346,8 +337,7 @@ Deno.test("buildProcessDataMappings - handles gaps in bit ranges", () => {
 
 Deno.test("buildProcessDataMappings - handles out-of-order slave definitions", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave2",
@@ -386,8 +376,7 @@ Deno.test("buildProcessDataMappings - handles out-of-order slave definitions", (
 
 Deno.test("buildProcessDataMappings - excludes variables that don't match any slave", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -417,8 +406,7 @@ Deno.test("buildProcessDataMappings - excludes variables that don't match any sl
 
 Deno.test("buildProcessDataMappings - handles slaves without processData", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -450,8 +438,7 @@ Deno.test("buildProcessDataMappings - handles slaves without processData", () =>
 
 Deno.test("buildProcessDataMappings - handles slaves with undefined offsets", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -480,8 +467,7 @@ Deno.test("buildProcessDataMappings - handles slaves with undefined offsets", ()
 
 Deno.test("buildProcessDataMappings - handles variables at exact boundary", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -517,8 +503,7 @@ Deno.test("buildProcessDataMappings - handles variables at exact boundary", () =
 
 Deno.test("buildProcessDataMappings - handles large bit offsets", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -549,8 +534,7 @@ Deno.test("buildProcessDataMappings - handles large bit offsets", () => {
 
 Deno.test("buildProcessDataMappings - handles partial byte overlaps correctly", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -582,8 +566,7 @@ Deno.test("buildProcessDataMappings - handles partial byte overlaps correctly", 
 
 Deno.test("buildProcessDataMappings - handles multiple BOOL variables in same byte", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -619,8 +602,7 @@ Deno.test("buildProcessDataMappings - handles multiple BOOL variables in same by
 
 Deno.test("buildProcessDataMappings - handles variable at end of slave range", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -653,8 +635,7 @@ Deno.test("buildProcessDataMappings - handles variable at end of slave range", (
 
 Deno.test("buildProcessDataMappings - excludes variable just outside slave range", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",
@@ -681,8 +662,7 @@ Deno.test("buildProcessDataMappings - excludes variable just outside slave range
 
 Deno.test("buildProcessDataMappings - handles complex multi-slave scenario", () => {
   const config: EniConfig = {
-    master: { cycleTime: 1000 },
-    interface: "eth0",
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
     slaves: [
       {
         name: "Slave1",

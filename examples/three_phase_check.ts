@@ -22,7 +22,7 @@ async function demonstrateThreePhaseWorkflow() {
     // Initialize master (this sets up the group and discovers slaves)
     await master.initialize();
     console.log("✓ Master initialized");
-    console.log("✓ Connected to interface " + config.interface);
+    console.log("✓ Connected to interface " + config.master.runtimeOptions.networkInterface);
 
     // Explicitly reset to INIT to clear any previous error states
     console.log("Requesting INIT state to clear faults...");

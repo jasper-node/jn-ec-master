@@ -7,8 +7,8 @@ Deno.test("Process Data Mapper - Basic Mapping", () => {
     master: {
       cycleTime: 10000, // 10ms (Feature 201)
       dcSupport: false,
+      runtimeOptions: { networkInterface: "eth0" },
     },
-    interface: "eth0",
     slaves: [
       {
         name: "Drive1",

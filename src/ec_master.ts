@@ -459,8 +459,8 @@ export class EcMaster extends EventEmitter {
           info: { name: "DenoMaster" },
           cycleTime: 10000, // 10ms default cycle time
           dcSupport: anyDcSupported,
+          runtimeOptions: { networkInterface: interfaceName },
         },
-        interface: interfaceName,
         slaves,
         processImage: {
           inputs: {
@@ -699,7 +699,7 @@ export class EcMaster extends EventEmitter {
     }
 
     // Interface name
-    const interfaceName = this.eniConfig.interface;
+    const interfaceName = this.eniConfig.master.runtimeOptions.networkInterface;
     const interfaceNameBuffer = new TextEncoder().encode(interfaceName + "\0");
 
     // Get timeout values from runtimeOptions with safe defaults

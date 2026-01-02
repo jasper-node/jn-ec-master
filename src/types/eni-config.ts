@@ -30,7 +30,9 @@ export interface EniConfig {
     /**
      * Non-standard runtime options for the wrapper (not part of ENI spec).
      */
-    runtimeOptions?: {
+    runtimeOptions: {
+      // Network interface (not in ENI, but required for execution)
+      networkInterface: string; // Required: "en0", "eth0", etc.
       pduTimeoutMs?: number;
       stateTransitionTimeoutMs?: number;
       mailboxResponseTimeoutMs?: number;
@@ -38,10 +40,6 @@ export interface EniConfig {
       pduRetries?: number;
     };
   };
-
-  // Network interface (not in ENI, but required for execution)
-  interface: string; // Required: "en0", "eth0", etc.
-  ecTimeoutRet_ms?: number; // Default: 3000
 
   // Slave configuration (from <Config><Slave>)
   slaves: EniSlaveConfig[];

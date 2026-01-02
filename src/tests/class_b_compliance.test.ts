@@ -98,8 +98,7 @@ function teardownMocks() {
 
 // Test configuration with CoE slave
 const configWithCoeSlave: EniConfig = {
-  master: { cycleTime: 1000 },
-  interface: "test-iface",
+  master: { cycleTime: 1000, runtimeOptions: { networkInterface: "test-iface" } },
   slaves: [
     {
       name: "EL4002",
@@ -120,8 +119,7 @@ const configWithCoeSlave: EniConfig = {
 
 // Test configuration without CoE
 const configWithoutCoe: EniConfig = {
-  master: { cycleTime: 1000 },
-  interface: "test-iface",
+  master: { cycleTime: 1000, runtimeOptions: { networkInterface: "test-iface" } },
   slaves: [
     {
       name: "NonCoE_Slave",

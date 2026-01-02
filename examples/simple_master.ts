@@ -45,7 +45,7 @@ if (configFile) {
   } else {
     config = await parseEniJson(configFile);
   }
-  config.interface = interfaceName;
+  config.master.runtimeOptions.networkInterface = interfaceName;
 } else {
   // Run discovery if no ENI file provided
   config = await EcMaster.discoverNetwork(interfaceName);

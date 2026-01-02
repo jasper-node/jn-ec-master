@@ -29,7 +29,7 @@ async function main() {
 
     // Override interface if provided
     if (interfaceName) {
-      eniConfig.interface = interfaceName;
+      eniConfig.master.runtimeOptions.networkInterface = interfaceName;
     }
 
     // Override cycleTime if --fast flag is used
@@ -41,7 +41,9 @@ async function main() {
       );
     }
 
-    console.log(`Initializing EtherCAT Master on ${eniConfig.interface}...`);
+    console.log(
+      `Initializing EtherCAT Master on ${eniConfig.master.runtimeOptions.networkInterface}...`,
+    );
 
     const master = new EcMaster(eniConfig);
 
