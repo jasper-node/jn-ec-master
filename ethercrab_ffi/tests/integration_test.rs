@@ -82,6 +82,8 @@ fn setup_hardware() -> bool {
         100,   // pdu_timeout_ms
         5000,  // state_transition_timeout_ms
         1000,  // mailbox_response_timeout_ms
+        100,   // eeprom_timeout_ms
+        3,     // pdu_retries
     );
     
     result == 0

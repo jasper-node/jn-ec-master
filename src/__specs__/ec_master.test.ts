@@ -425,6 +425,12 @@ const mockSymbols = {
   ethercrab_configure_mailbox_polling: () => 0,
   ethercrab_scan_free: () => {},
   ethercrab_destroy: () => {},
+  ethercrab_version: (buf: Uint8Array, _len: number) => {
+    const version = "0.1.1";
+    const encoded = new TextEncoder().encode(version);
+    buf.set(encoded);
+    return encoded.length;
+  },
   // THE CORE TEST TARGET:
   ethercrab_check_mailbox_resilient: (_idx: number, _addr: number, _lastToggle: number) => 0, // Default to empty
   ethercrab_get_last_emergency: (_buf: Uint8Array) => 1, // Default: No emergency

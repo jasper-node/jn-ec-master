@@ -17,9 +17,18 @@ export const ethercrabSymbols = {
       "u64", // pdu_timeout_ms
       "u64", // state_transition_timeout_ms
       "u64", // mailbox_response_timeout_ms
+      "u64", // eeprom_timeout_ms
+      "usize", // pdu_retries
     ],
     result: "i32",
     nonblocking: true, // Async: Network I/O (Init sequence)
+  },
+  ethercrab_version: {
+    parameters: [
+      "buffer", // buffer: *mut u8
+      "usize", // len: usize
+    ],
+    result: "i32", // bytes written
   },
   ethercrab_get_last_error: {
     parameters: [

@@ -39,6 +39,12 @@ function setupMocks() {
         ethercrab_get_last_emergency: (_buf: any) => 0, // Sync
         is_raw_socket_available: () => 1, // Sync
         ethercrab_get_last_error: (_buf: any, _len: any) => 0, // Sync
+        ethercrab_version: (buf: Uint8Array, _len: any) => {
+          const version = "0.1.1";
+          const encoded = new TextEncoder().encode(version);
+          buf.set(encoded);
+          return encoded.length;
+        },
       },
       close: () => {},
     };

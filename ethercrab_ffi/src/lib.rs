@@ -149,6 +149,20 @@ fn store_emergency(state: &mut EcMasterState, slave_index: u16, error_code: u16,
 // --- FFI Exports ---
 
 #[no_mangle]
+pub extern "C" fn ethercrab_version(buffer: *mut u8, len: usize) -> c_int {
+    let version = env!("CARGO_PKG_VERSION");
+    let version_bytes = version.as_bytes();
+    if buffer.is_null() || len == 0 {
+        return version_bytes.len() as c_int;
+    }
+    let to_copy = version_bytes.len().min(len);
+    unsafe {
+        std::ptr::copy_nonoverlapping(version_bytes.as_ptr(), buffer, to_copy);
+    }
+    to_copy as c_int
+}
+
+#[no_mangle]
 pub extern "C" fn ethercrab_get_last_error(buffer: *mut u8, len: usize) -> c_int {
     if buffer.is_null() || len == 0 {
         return 0;
@@ -216,6 +230,8 @@ pub extern "C" fn ethercrab_init(
     pdu_timeout_ms: u64,
     state_transition_timeout_ms: u64,
     mailbox_response_timeout_ms: u64,
+    eeprom_timeout_ms: u64,
+    pdu_retries: usize,
 ) -> c_int {
     if interface.is_null() { return -1; }
 
@@ -240,8 +256,8 @@ pub extern "C" fn ethercrab_init(
         pdu: Duration::from_millis(pdu_timeout_ms),
         state_transition: Duration::from_millis(state_transition_timeout_ms),
         mailbox_response: Duration::from_millis(mailbox_response_timeout_ms),
-        // Keep other timeouts at defaults
-        eeprom: Duration::from_millis(10),
+        // Configurable eeprom timeout
+        eeprom: Duration::from_millis(eeprom_timeout_ms),
         wait_loop_delay: Duration::from_millis(0),
         mailbox_echo: Duration::from_millis(100),
     };
@@ -261,6 +277,7 @@ pub extern "C" fn ethercrab_init(
                     timeouts,
                     MainDeviceConfig {
                         dc_static_sync_iterations: 0,  // Disable DC to avoid timeouts
+                        retry_behaviour: ethercrab::RetryBehaviour::Count(pdu_retries),
                         ..MainDeviceConfig::default()
                     },
                 ));

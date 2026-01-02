@@ -32,6 +32,8 @@ import { buildProcessDataMappings } from "./utils/process-data-mapper.ts";
 import { EventEmitter } from "node:events";
 import { join } from "@std/path";
 
+const REQUIRED_FFI_VERSION = "0.1.1";
+
 export { AlStatusCode, RegisterAddress, SlaveState };
 export type { EmergencyEvent, EniConfig, StateChangeEvent };
 
@@ -107,7 +109,51 @@ export class EcMaster extends EventEmitter {
       throw error;
     }
 
-    return Deno.dlopen(libPath, ethercrabSymbols);
+    let lib: Deno.DynamicLibrary<typeof ethercrabSymbols>;
+    try {
+      lib = Deno.dlopen(libPath, ethercrabSymbols);
+    } catch (error) {
+      // Handle symbol mismatch or other loading errors
+      if (
+        error instanceof Error &&
+        (error.message.includes("Symbol") || error.message.includes("procedure"))
+      ) {
+        throw new Error(
+          `EtherCAT library incompatible (load failed).\n` +
+            `Please run the following command to download the binaries:\n` +
+            `deno run --allow-run --allow-net --allow-write --allow-read jsr:@controlx-io/jn-ec-master/scripts/download-binaries.ts`,
+        );
+      }
+      throw error;
+    }
+
+    try {
+      const buf = new Uint8Array(64);
+      const len = lib.symbols.ethercrab_version(buf, BigInt(buf.length));
+      const version = new TextDecoder().decode(buf.subarray(0, len));
+
+      if (version !== REQUIRED_FFI_VERSION) {
+        lib.close();
+        throw new Error(
+          `EtherCAT library version mismatch.\n` +
+            `Expected: ${REQUIRED_FFI_VERSION}, Found: ${version}\n` +
+            `Please run the following command to download the binaries:\n` +
+            `deno run --allow-run --allow-net --allow-write --allow-read jsr:@controlx-io/jn-ec-master/scripts/download-binaries.ts`,
+        );
+      }
+    } catch (error) {
+      lib.close();
+      if (error instanceof TypeError && error.message.includes("not a function")) {
+        throw new Error(
+          `EtherCAT library version check failed.\n` +
+            `Please run the following command to download the binaries:\n` +
+            `deno run --allow-run --allow-net --allow-write --allow-read jsr:@controlx-io/jn-ec-master/scripts/download-binaries.ts`,
+        );
+      }
+      throw error;
+    }
+
+    return lib;
   }
 
   constructor(eniConfig: EniConfig, dirPath?: string) {
@@ -661,6 +707,8 @@ export class EcMaster extends EventEmitter {
     const pduTimeoutMs = runtimeOpts.pduTimeoutMs ?? 100; // Default: 100ms (increased from 30ms)
     const stateTransitionTimeoutMs = runtimeOpts.stateTransitionTimeoutMs ?? 5000; // Default: 5000ms
     const mailboxResponseTimeoutMs = runtimeOpts.mailboxResponseTimeoutMs ?? 1000; // Default: 1000ms
+    const eepromTimeoutMs = runtimeOpts.eepromTimeoutMs ?? 100; // Default: 100ms
+    const pduRetries = runtimeOpts.pduRetries ?? 3; // Default: 3 retries
 
     // 1. Initialize ethercrab
     const result = await this.dl.symbols.ethercrab_init(
@@ -672,6 +720,8 @@ export class EcMaster extends EventEmitter {
       BigInt(pduTimeoutMs),
       BigInt(stateTransitionTimeoutMs),
       BigInt(mailboxResponseTimeoutMs),
+      BigInt(eepromTimeoutMs),
+      BigInt(pduRetries),
     );
 
     if (result < 0) {

@@ -34,6 +34,8 @@ export interface EniConfig {
       pduTimeoutMs?: number;
       stateTransitionTimeoutMs?: number;
       mailboxResponseTimeoutMs?: number;
+      eepromTimeoutMs?: number;
+      pduRetries?: number;
     };
   };
 
