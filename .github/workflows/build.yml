@@ -236,4 +236,4 @@ jobs:
             - Windows: Use `libethercrab_ffi.dll` as-is
           files: dist/lib-binaries.zip
           draft: false
-          prerelease: ${{ contains(steps.tag_version.outputs.version, '-') || contains(steps.tag_version.outputs.version, 'beta') || contains(steps.tag_version.outputs.version, 'alpha') }}
+          prerelease: ${{ (contains(steps.tag_version.outputs.version, '-') && !contains(steps.tag_version.outputs.version, '-lib')) || contains(steps.tag_version.outputs.version, 'beta') || contains(steps.tag_version.outputs.version, 'alpha') }}
