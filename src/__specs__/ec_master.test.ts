@@ -1,8 +1,9 @@
-import { assertEquals, assertExists } from "@std/assert";
+import { assertEquals, assertExists, assertRejects } from "@std/assert";
 import { assertSpyCall, spy, stub } from "@std/testing/mock";
 import { EcMaster } from "../ec_master.ts";
 import type { EniConfig } from "../types/eni-config.ts";
 import type { EmergencyEvent } from "../types/ec_types.ts";
+import { FfiError, PdoIntegrityError } from "../types/errors.ts";
 
 /**
  * Tests for startEmergencyPolling method (lines 878-879)
@@ -550,5 +551,229 @@ Deno.test("Mailbox Resilience: Retry Failure Handling", async () => {
     dlopenStub.restore();
     statStub.restore();
     checkStub.restore();
+  }
+});
+
+// --- Ride-Through Logic Tests (Feature 105) ---
+
+// Extended mock symbols for runCycle tests
+const createCycleMockSymbols = (cyclicTxRxFn: () => number) => ({
+  ethercrab_init: () => 0,
+  ethercrab_get_pdi_total_size: () => 0,
+  ethercrab_get_pdi_buffer_ptr: () => Deno.UnsafePointer.create(0n),
+  ethercrab_configure_mailbox_polling: () => 0,
+  ethercrab_scan_free: () => {},
+  ethercrab_destroy: () => {},
+  ethercrab_get_state: () => 1, // INIT state
+  ethercrab_get_last_error: (buf: Uint8Array, _len: bigint) => {
+    const msg = "Test error";
+    const encoded = new TextEncoder().encode(msg);
+    buf.set(encoded);
+    return encoded.length;
+  },
+  ethercrab_version: (buf: Uint8Array, _len: number) => {
+    const version = "0.1.1";
+    const encoded = new TextEncoder().encode(version);
+    buf.set(encoded);
+    return encoded.length;
+  },
+  ethercrab_check_mailbox_resilient: () => 0,
+  ethercrab_get_last_emergency: () => 1,
+  ethercrab_cyclic_tx_rx: cyclicTxRxFn,
+});
+
+function createCycleTestMaster(cyclicTxRxFn: () => number) {
+  const mockSyms = createCycleMockSymbols(cyclicTxRxFn);
+
+  const dlopenStub = stub(Deno, "dlopen", () => ({
+    symbols: mockSyms,
+    close: () => {},
+  } as any));
+
+  const statStub = stub(Deno, "statSync", () => ({ isFile: true } as any));
+
+  const master = new EcMaster(MOCK_ENI);
+
+  return { master, dlopenStub, statStub, mockSyms };
+}
+
+Deno.test("Ride-Through: Single PDU timeout returns -2 without throwing", async () => {
+  const { master, dlopenStub, statStub } = createCycleTestMaster(() => -2);
+
+  try {
+    // A single timeout should return -2 but NOT throw
+    const wkc = await master.runCycle();
+    assertEquals(wkc, -2);
+  } finally {
+    master.close();
+    dlopenStub.restore();
+    statStub.restore();
+  }
+});
+
+Deno.test("Ride-Through: 4 consecutive PDU timeouts do not throw", async () => {
+  let callCount = 0;
+  const { master, dlopenStub, statStub } = createCycleTestMaster(() => {
+    callCount++;
+    return -2; // Always timeout
+  });
+
+  try {
+    // 4 consecutive timeouts should NOT throw (threshold is 5)
+    for (let i = 0; i < 4; i++) {
+      const wkc = await master.runCycle();
+      assertEquals(wkc, -2, `Cycle ${i + 1} should return -2`);
+    }
+    assertEquals(callCount, 4);
+  } finally {
+    master.close();
+    dlopenStub.restore();
+    statStub.restore();
+  }
+});
+
+Deno.test("Ride-Through: 5 consecutive PDU timeouts throw FfiError", async () => {
+  const { master, dlopenStub, statStub } = createCycleTestMaster(() => -2);
+
+  try {
+    // First 4 timeouts should not throw
+    for (let i = 0; i < 4; i++) {
+      await master.runCycle();
+    }
+
+    // 5th timeout should throw FfiError
+    await assertRejects(
+      () => master.runCycle(),
+      FfiError,
+      "Critical Network Failure: 5 consecutive timeouts",
+    );
+  } finally {
+    master.close();
+    dlopenStub.restore();
+    statStub.restore();
+  }
+});
+
+Deno.test("Ride-Through: Successful cycle resets missedCycleCount", async () => {
+  let returnValue = -2;
+  const { master, dlopenStub, statStub } = createCycleTestMaster(() => returnValue);
+
+  try {
+    // Simulate 3 timeouts
+    for (let i = 0; i < 3; i++) {
+      await master.runCycle();
+    }
+
+    // Now simulate a successful cycle (wkc = 1)
+    returnValue = 1;
+    const wkc = await master.runCycle();
+    assertEquals(wkc, 1);
+
+    // Now simulate 4 more timeouts - should NOT throw because counter was reset
+    returnValue = -2;
+    for (let i = 0; i < 4; i++) {
+      const result = await master.runCycle();
+      assertEquals(result, -2, `Cycle ${i + 1} after reset should return -2`);
+    }
+
+    // 5th timeout after reset should throw
+    await assertRejects(
+      () => master.runCycle(),
+      FfiError,
+      "Critical Network Failure",
+    );
+  } finally {
+    master.close();
+    dlopenStub.restore();
+    statStub.restore();
+  }
+});
+
+Deno.test("Ride-Through: WKC mismatch (-4) uses ride-through logic", async () => {
+  const { master, dlopenStub, statStub } = createCycleTestMaster(() => -4);
+
+  try {
+    // First 4 WKC mismatches should return -4 without throwing
+    for (let i = 0; i < 4; i++) {
+      const wkc = await master.runCycle();
+      assertEquals(wkc, -4, `Cycle ${i + 1} should return -4`);
+    }
+
+    // 5th WKC mismatch should throw PdoIntegrityError
+    await assertRejects(
+      () => master.runCycle(),
+      PdoIntegrityError,
+      "WKC mismatch",
+    );
+  } finally {
+    master.close();
+    dlopenStub.restore();
+    statStub.restore();
+  }
+});
+
+Deno.test("Ride-Through: Mixed timeout and WKC errors accumulate", async () => {
+  let callCount = 0;
+  const { master, dlopenStub, statStub } = createCycleTestMaster(() => {
+    callCount++;
+    // Alternate between -2 (timeout) and -4 (WKC mismatch)
+    return callCount % 2 === 1 ? -2 : -4;
+  });
+
+  try {
+    // 4 mixed errors should not throw
+    for (let i = 0; i < 4; i++) {
+      const wkc = await master.runCycle();
+      assertEquals(wkc < 0, true, `Cycle ${i + 1} should return negative`);
+    }
+
+    // 5th error should throw (counter accumulated from both error types)
+    await assertRejects(
+      () => master.runCycle(),
+      FfiError, // -2 is returned on 5th call (odd number)
+      "Critical Network Failure",
+    );
+  } finally {
+    master.close();
+    dlopenStub.restore();
+    statStub.restore();
+  }
+});
+
+Deno.test("Ride-Through: Other fatal errors throw immediately", async () => {
+  const { master, dlopenStub, statStub } = createCycleTestMaster(() => -1);
+
+  try {
+    // Any error other than -2 or -4 should throw immediately
+    await assertRejects(
+      () => master.runCycle(),
+      FfiError,
+      "Cyclic task failed",
+    );
+  } finally {
+    master.close();
+    dlopenStub.restore();
+    statStub.restore();
+  }
+});
+
+Deno.test("Ride-Through: missedCycleCount is accessible for diagnostics", async () => {
+  const { master, dlopenStub, statStub } = createCycleTestMaster(() => -2);
+
+  try {
+    // Access private property for testing
+    const masterAny = master as any;
+
+    assertEquals(masterAny.missedCycleCount, 0, "Initial count should be 0");
+
+    await master.runCycle();
+    assertEquals(masterAny.missedCycleCount, 1, "Count should be 1 after first timeout");
+
+    await master.runCycle();
+    assertEquals(masterAny.missedCycleCount, 2, "Count should be 2 after second timeout");
+  } finally {
+    master.close();
+    dlopenStub.restore();
+    statStub.restore();
   }
 });

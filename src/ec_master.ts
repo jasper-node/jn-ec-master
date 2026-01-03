@@ -88,6 +88,11 @@ export class EcMaster extends EventEmitter {
   private emergencyPollingInterval?: number; // Timer ID
   private lastEmergencySlave: Map<number, EmergencyEvent> = new Map(); // Track per-slave
 
+  // FAULT TOLERANCE CONFIGURATION
+  // 5 consecutive timeouts @ 20ms cycle = 100ms "Ride Through" duration
+  private static readonly MAX_MISSED_CYCLES = 5;
+  private missedCycleCount = 0;
+
   /**
    * Open the platform-specific dynamic library.
    * @returns A Deno.DynamicLibrary instance for the ethercrab FFI symbols
@@ -749,10 +754,11 @@ export class EcMaster extends EventEmitter {
 
   async runCycle(): Promise<number> {
     // Single FFI call - Rust handles everything
-    // Note: This is marked as nonblocking but internally uses block_on, so it may block
+    // Note: This is marked as non blocking but internally uses block_on, so it may block
     // The FFI function also updates the shared memory backing this.pdiBuffer
 
     // Ensure buffer is up-to-date before running cycle (in case it wasn't updated after state transition)
+    // 1. Prepare PDI Buffer
     if (!this.pdiBuffer || this.pdiBuffer.length === 0) {
       const currentState = this.getState();
       if (currentState === SlaveState.SAFE_OP || currentState === SlaveState.OP) {
@@ -760,7 +766,7 @@ export class EcMaster extends EventEmitter {
       }
     }
 
-    // Write output values from processDataMappings to pdiBuffer before cycle
+    // 2. Write Outputs (Always attempt to write, even if previous cycle failed)
     if (this.pdiView && this.pdiBuffer) {
       for (const mapping of this.outputMappings) {
         if (
@@ -768,23 +774,56 @@ export class EcMaster extends EventEmitter {
           mapping.newValue !== mapping.currentValue
         ) {
           this.writeValueToBuffer(this.pdiView, this.pdiBuffer, mapping, mapping.newValue);
-          mapping.currentValue = mapping.newValue; // Sync cached value
+          mapping.currentValue = mapping.newValue;
         }
       }
     }
 
+    // 3. Perform Cycle (FFI Call)
     const wkc = await this.dl.symbols.ethercrab_cyclic_tx_rx();
 
+    // 4. ROBUST ERROR HANDLING (Feature 105)
     if (wkc < 0) {
-      if (wkc === -4) {
-        // Get last error which should contain actual vs expected WKC
-        const errMsg = this.getLastError();
-        throw new PdoIntegrityError(`WKC mismatch: ${errMsg} (Code: ${wkc})`);
+      // CODE -2: PDU TIMEOUT (Transient)
+      if (wkc === -2) {
+        this.missedCycleCount++;
+
+        // Critical Threshold Reached?
+        if (this.missedCycleCount >= EcMaster.MAX_MISSED_CYCLES) {
+          throw new FfiError(
+            `Critical Network Failure: ${this.missedCycleCount} consecutive timeouts. Connection lost.`,
+            wkc,
+          );
+        }
+
+        // We return -2 so the app knows stats, but we DO NOT throw.
+        return wkc;
       }
+
+      // CODE -4: INTEGRITY ERROR (WKC Mismatch)
+      if (wkc === -4) {
+        // This usually means data returned but count was wrong.
+        // Increment missed cycle count for integrity errors too
+        this.missedCycleCount++;
+
+        // Critical Threshold Reached?
+        if (this.missedCycleCount >= EcMaster.MAX_MISSED_CYCLES) {
+          const errMsg = this.getLastError();
+          throw new PdoIntegrityError(`WKC mismatch: ${errMsg} (Code: ${wkc})`);
+        }
+
+        return wkc;
+      }
+
+      // OTHER FATAL ERRORS (Driver failure, etc.)
       throw new FfiError(`Cyclic task failed: ${this.getLastError()}`, wkc);
     }
 
-    // Read input values from pdiBuffer to processDataMappings after cycle
+    // 5. SUCCESS PATH
+    // Reset the error counter immediately upon one successful packet
+    this.missedCycleCount = 0;
+
+    // 6. Read Inputs (Only parse data if cycle was successful!)
     if (this.pdiView && this.pdiBuffer) {
       for (const mapping of this.inputMappings) {
         mapping.currentValue = this.readValueFromBuffer(this.pdiView, this.pdiBuffer, mapping);
