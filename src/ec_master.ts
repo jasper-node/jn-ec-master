@@ -138,11 +138,11 @@ export class EcMaster extends EventEmitter {
       const len = lib.symbols.ethercrab_version(buf, BigInt(buf.length));
       const version = new TextDecoder().decode(buf.subarray(0, len));
 
-      if (version !== REQUIRED_FFI_VERSION) {
+      if (version !== EcMaster.REQUIRED_FFI_VERSION) {
         lib.close();
         throw new Error(
           `EtherCAT library version mismatch.\n` +
-            `Expected: ${REQUIRED_FFI_VERSION}, Found: ${version}\n` +
+            `Expected: ${EcMaster.REQUIRED_FFI_VERSION}, Found: ${version}\n` +
             `Please run the following command to download the binaries:\n` +
             `deno run --allow-run --allow-net --allow-write --allow-read jsr:@controlx-io/jn-ec-master/scripts/download-binaries.ts`,
         );
@@ -1032,7 +1032,11 @@ export class EcMaster extends EventEmitter {
 
     // Start polling loop
     this.mailboxPollingInterval = setInterval(async () => {
+      if (this.isClosed) return;
+
       for (const { slave, index } of mailboxSlaves) {
+        if (this.isClosed) break;
+
         try {
           const statusAddr = slave.mailboxStatusAddr!;
           // Default 2 (first run) if not set
@@ -1045,6 +1049,9 @@ export class EcMaster extends EventEmitter {
             statusAddr,
             lastToggle,
           );
+
+          // Check again after await - library might have been closed during the call
+          if (this.isClosed) break;
 
           if (result === 1) {
             // Success: New mail detected
@@ -1071,7 +1078,9 @@ export class EcMaster extends EventEmitter {
             });
           }
         } catch (error) {
-          console.warn(`Mailbox polling failed for slave ${index}:`, error);
+          if (!this.isClosed) {
+            console.warn(`Mailbox polling failed for slave ${index}:`, error);
+          }
         }
       }
     }, minPollTime);
@@ -1100,6 +1109,8 @@ export class EcMaster extends EventEmitter {
     if (coeSlaves.length === 0) return;
 
     this.emergencyPollingInterval = setInterval(() => {
+      if (this.isClosed) return;
+
       // Rust stores the *last* global emergency.
       // We poll it and check if it applies to one of our CoE slaves.
       const emergency = this.getLastEmergency();
@@ -1237,23 +1248,31 @@ export class EcMaster extends EventEmitter {
   }
 
   getLastEmergency(): EmergencyEvent | null {
-    const buffer = new Uint8Array(EMERGENCY_INFO_SIZE);
-    const res = this.dl.symbols.ethercrab_get_last_emergency(buffer);
-    if (res === 0) {
-      const view = new DataView(buffer.buffer);
-      // slave_index (u16), error_code (u16), error_register (u8)
-      // Layout: 0:u16, 2:u16, 4:u8
-      return {
-        slaveId: view.getUint16(0, true),
-        errorCode: view.getUint16(2, true),
-        errorReg: view.getUint8(4),
-      };
+    if (this.isClosed) return null;
+
+    try {
+      const buffer = new Uint8Array(EMERGENCY_INFO_SIZE);
+      const res = this.dl.symbols.ethercrab_get_last_emergency(buffer);
+      if (res === 0) {
+        const view = new DataView(buffer.buffer);
+        // slave_index (u16), error_code (u16), error_register (u8)
+        // Layout: 0:u16, 2:u16, 4:u8
+        return {
+          slaveId: view.getUint16(0, true),
+          errorCode: view.getUint16(2, true),
+          errorReg: view.getUint8(4),
+        };
+      }
+      return null;
+    } catch {
+      // Suppress errors if library is closed
+      return null;
     }
-    return null;
   }
 
   // Cleanup
   close(): void {
+    this.isClosed = true;
     this.stopMailboxPolling();
     this.stopEmergencyPolling();
     try {
