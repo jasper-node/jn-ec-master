@@ -33,11 +33,11 @@ export interface EniConfig {
     runtimeOptions: {
       // Network interface (not in ENI, but required for execution)
       networkInterface: string; // Required: "en0", "eth0", etc.
-      pduTimeoutMs?: number;
-      stateTransitionTimeoutMs?: number;
-      mailboxResponseTimeoutMs?: number;
-      eepromTimeoutMs?: number;
-      pduRetries?: number;
+      pduTimeoutMs?: number; // Default: 100ms
+      stateTransitionTimeoutMs?: number; // Default: 1000ms
+      mailboxResponseTimeoutMs?: number; // Default: 1000ms
+      eepromTimeoutMs?: number; // Default: 100ms
+      pduRetries?: number; // Default: 3 retries
     };
   };
 

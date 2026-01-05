@@ -709,8 +709,8 @@ export class EcMaster extends EventEmitter {
 
     // Get timeout values from runtimeOptions with safe defaults
     const runtimeOpts = this.eniConfig.master.runtimeOptions || {};
-    const pduTimeoutMs = runtimeOpts.pduTimeoutMs ?? 100; // Default: 100ms (increased from 30ms)
-    const stateTransitionTimeoutMs = runtimeOpts.stateTransitionTimeoutMs ?? 5000; // Default: 5000ms
+    const pduTimeoutMs = runtimeOpts.pduTimeoutMs ?? 100; // Default: 100ms
+    const stateTransitionTimeoutMs = runtimeOpts.stateTransitionTimeoutMs ?? 1000; // Default: 1000ms
     const mailboxResponseTimeoutMs = runtimeOpts.mailboxResponseTimeoutMs ?? 1000; // Default: 1000ms
     const eepromTimeoutMs = runtimeOpts.eepromTimeoutMs ?? 100; // Default: 100ms
     const pduRetries = runtimeOpts.pduRetries ?? 3; // Default: 3 retries
