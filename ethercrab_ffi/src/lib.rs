@@ -1,5 +1,6 @@
 use std::ffi::{CStr, c_char, c_int};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use ethercrab::{
     MainDevice, MainDeviceConfig, PduStorage, Timeouts, std::ethercat_now,
@@ -37,9 +38,9 @@ struct EcMasterState {
     output_size: usize,
     expected_wkc: u16,
     mailbox_poll_interval_ms: Option<u32>,
-    last_emergency: Option<InternalEmergencyInfo>,
 }
 
+#[derive(Clone, Copy)]
 struct InternalEmergencyInfo {
     slave_index: u16,
     error_code: u16,
@@ -47,9 +48,11 @@ struct InternalEmergencyInfo {
 }
 
 // --- Global State ---
-static STATE: Lazy<Mutex<Option<EcMasterState>>> = Lazy::new(|| Mutex::new(None));
+static STATE: Lazy<RwLock<Option<EcMasterState>>> = Lazy::new(|| RwLock::new(None));
 static GLOBAL_DEVICE: OnceCell<Arc<MainDevice<'static>>> = OnceCell::new();
 static LAST_ERROR: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+static LAST_EMERGENCY: Lazy<Mutex<Option<InternalEmergencyInfo>>> = Lazy::new(|| Mutex::new(None));
+static NETWORK_HEALTHY: AtomicBool = AtomicBool::new(true);
 
 fn set_error(err: impl std::fmt::Display) {
     let mut guard = LAST_ERROR.lock();
@@ -138,8 +141,9 @@ fn u32_from_bytes(bytes: [u8; 4]) -> u32 {
 }
 
 #[allow(dead_code)]
-fn store_emergency(state: &mut EcMasterState, slave_index: u16, error_code: u16, error_register: u8) {
-    state.last_emergency = Some(InternalEmergencyInfo {
+fn store_emergency(_state: &mut EcMasterState, slave_index: u16, error_code: u16, error_register: u8) {
+    let mut guard = LAST_EMERGENCY.lock();
+    *guard = Some(InternalEmergencyInfo {
         slave_index,
         error_code,
         error_register,
@@ -264,6 +268,9 @@ pub extern "C" fn ethercrab_init(
 
     // Run purely on this thread. smol::block_on spins a local executor.
     let result = smol::block_on(async move {
+        // Reset health status
+        NETWORK_HEALTHY.store(true, Ordering::Relaxed);
+
         let maindevice = match GLOBAL_DEVICE.get() {
             Some(md) => md.clone(),
             None => {
@@ -350,10 +357,10 @@ pub extern "C" fn ethercrab_init(
             output_size: 0,
             expected_wkc: 0,
             mailbox_poll_interval_ms: None,
-            last_emergency: None,
         };
 
-        *STATE.lock() = Some(master_state);
+    let mut guard = STATE.write();
+        *guard = Some(master_state);
         Ok(0)
     });
 
@@ -374,7 +381,7 @@ pub extern "C" fn ethercrab_verify_topology(
     
     // We need to access the group to iterate.
     // We can do this synchronously because we are just reading memory, not doing I/O.
-    let guard = STATE.lock();
+    let guard = STATE.read();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -415,7 +422,7 @@ pub extern "C" fn ethercrab_verify_topology(
 
 #[no_mangle]
 pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
-    let mut guard = STATE.lock();
+    let mut guard = STATE.write();
     let state = match guard.as_mut() {
         Some(s) => s,
         None => return -1,
@@ -426,18 +433,8 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
 
     let result = smol::block_on(async {
         match (target_state, group_enum) {
-            // Init (0) / PreOp (1)
-            (0 | 1, Some(g_any)) => {
-                // If we are in any state, we can technically treat it as PreOp for basic access,
-                // but real EtherCAT down-transition requires logic. 
-                // For now, we just return the group as is if it's already compatible.
-                 match g_any {
-                     GroupState::PreOp(g) => Ok((Some(GroupState::PreOp(g)), 0, 0, 0)),
-                     // Downgrading from SafeOp/Op not fully implemented in this snippet for brevity,
-                     // but we restore the state.
-                     other => Ok((Some(other), state.input_size, state.output_size, state.expected_wkc)),
-                 }
-            },
+            // Init (0) / PreOp (1) handled below
+
             
             // To SafeOp (2)
             (2, Some(GroupState::PreOp(g))) => {
@@ -464,6 +461,17 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
                 Ok((Some(GroupState::SafeOp(g_safe)), in_sz, out_sz, wkc_count))
             },
             (2, Some(GroupState::SafeOp(g))) => Ok((Some(GroupState::SafeOp(g)), state.input_size, state.output_size, state.expected_wkc)),
+            (2, Some(GroupState::Op(g))) => {
+                // Op -> SafeOp
+                let g_safe = match g.into_safe_op(&maindevice).await {
+                    Ok(g) => g,
+                    Err(e) => {
+                        set_error(format!("into_safe_op failed: {:?}", e));
+                        return Err(-3);
+                    }
+                };
+                Ok((Some(GroupState::SafeOp(g_safe)), state.input_size, state.output_size, state.expected_wkc))
+            },
             
             // To Op (3)
             (3, Some(GroupState::SafeOp(g))) => {
@@ -475,8 +483,35 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
             },
             (3, Some(GroupState::Op(g))) => Ok((Some(GroupState::Op(g)), state.input_size, state.output_size, state.expected_wkc)),
             
+            // To PreOp (1) or Init (0)
+            (0 | 1, Some(g_any)) => {
+                 match g_any {
+                     GroupState::PreOp(g) => Ok((Some(GroupState::PreOp(g)), 0, 0, 0)),
+                     GroupState::SafeOp(g) => {
+                        let g_pre = g.into_pre_op(&maindevice).await.map_err(|e| {
+                            set_error(format!("into_pre_op failed: {:?}", e));
+                            -3
+                        })?;
+                        Ok((Some(GroupState::PreOp(g_pre)), 0, 0, 0))
+                     },
+                     GroupState::Op(g) => {
+                        // Op -> SafeOp -> PreOp
+                        let g_safe = g.into_safe_op(&maindevice).await.map_err(|e| {
+                            set_error(format!("into_safe_op failed: {:?}", e));
+                            -3
+                        })?;
+                        let g_pre = g_safe.into_pre_op(&maindevice).await.map_err(|e| {
+                            set_error(format!("into_pre_op failed: {:?}", e));
+                            -3
+                        })?;
+                        Ok((Some(GroupState::PreOp(g_pre)), 0, 0, 0))
+                     }
+                 }
+            },
+            
             // Invalid Transitions
             (_, Some(g)) => Ok((Some(g), state.input_size, state.output_size, state.expected_wkc)), 
+
             (_, None) => {
                 set_error("No group available for state transition");
                 Err(-2)
@@ -499,7 +534,7 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn ethercrab_get_state() -> u8 {
-    let guard = STATE.lock();
+    let guard = STATE.read();
     if let Some(state) = guard.as_ref() {
         match &state.group {
             Some(GroupState::PreOp(_)) => 1,
@@ -516,7 +551,7 @@ pub extern "C" fn ethercrab_get_state() -> u8 {
 pub extern "C" fn ethercrab_get_al_status_code(slave_index: u16) -> u16 {
    
     let result = smol::block_on(async move {
-        let guard = STATE.lock();
+        let guard = STATE.read();
         if let Some(ref master_state) = *guard {
             let maindevice = &master_state.maindevice;
             let idx = slave_index as usize;
@@ -565,7 +600,7 @@ pub extern "C" fn ethercrab_get_al_status_code(slave_index: u16) -> u16 {
 /// Note: Deno FFI doesn't correctly marshal pointers in struct returns, so we use separate functions.
 #[no_mangle]
 pub extern "C" fn ethercrab_get_pdi_buffer_ptr() -> *mut u8 {
-    let guard = STATE.lock();
+    let guard = STATE.read();
     if let Some(state) = guard.as_ref() {
         let buf_guard = state.pdi_buffer.read();
         let ptr = buf_guard.as_ptr() as *mut u8;
@@ -579,7 +614,7 @@ pub extern "C" fn ethercrab_get_pdi_buffer_ptr() -> *mut u8 {
 /// Returns total PDI size in bytes.
 #[no_mangle]
 pub extern "C" fn ethercrab_get_pdi_total_size() -> u32 {
-    let guard = STATE.lock();
+    let guard = STATE.read();
     if let Some(state) = guard.as_ref() {
         state.pdi_size as u32
     } else {
@@ -589,14 +624,14 @@ pub extern "C" fn ethercrab_get_pdi_total_size() -> u32 {
 
 #[no_mangle]
 pub extern "C" fn ethercrab_cyclic_tx_rx() -> c_int {
-    let mut guard = STATE.lock();
-    let state = match guard.as_mut() {
+    let guard = STATE.read();
+    let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
     };
 
     // Fast path check
-    let group = match &mut state.group {
+    let group = match &state.group {
         Some(GroupState::Op(g)) => g,
         _ => return -2,
     };
@@ -620,10 +655,15 @@ pub extern "C" fn ethercrab_cyclic_tx_rx() -> c_int {
     }
 
     // Perform IO (Blocking call on this thread)
-    // This drives the future to completion synchronously
+    // We rely on ethercrab's internal PDU timeout configuration.
+    // Lock contention from background tasks is handled by pausing them via NETWORK_HEALTHY flag.
     let wkc = match smol::block_on(group.tx_rx(maindevice)) {
-        Ok(res) => res.working_counter,
+        Ok(res) => {
+            NETWORK_HEALTHY.store(true, Ordering::Relaxed);
+            res.working_counter
+        },
         Err(e) => {
+            NETWORK_HEALTHY.store(false, Ordering::Relaxed);
             set_error(format!("Cyclic tx_rx failed: {:?}", e));
             return -2;
         },
@@ -658,7 +698,7 @@ pub extern "C" fn ethercrab_sdo_read(
 ) -> c_int {
     if data_out.is_null() || max_len == 0 { return -4; }
 
-    let guard = STATE.lock();
+    let guard = STATE.read();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -720,7 +760,7 @@ pub extern "C" fn ethercrab_sdo_write(
     let mut data_buf = [0u8; 4];
     unsafe { std::ptr::copy_nonoverlapping(data, data_buf.as_mut_ptr(), len); }
 
-    let guard = STATE.lock();
+    let guard = STATE.read();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -772,7 +812,7 @@ pub extern "C" fn ethercrab_eeprom_read(
 ) -> c_int {
     if data_out.is_null() || len == 0 { return -4; }
 
-    let guard = STATE.lock();
+    let guard = STATE.read();
     let state = match guard.as_ref() {
         Some(s) => s,
         None => return -1,
@@ -809,7 +849,7 @@ pub extern "C" fn ethercrab_eeprom_read(
 
 #[no_mangle]
 pub extern "C" fn ethercrab_configure_mailbox_polling(interval_ms: u32) -> c_int {
-    let mut guard = STATE.lock();
+    let mut guard = STATE.write();
     if let Some(state) = guard.as_mut() {
         if interval_ms == 0 {
             state.mailbox_poll_interval_ms = None;
@@ -824,25 +864,32 @@ pub extern "C" fn ethercrab_configure_mailbox_polling(interval_ms: u32) -> c_int
 
 #[no_mangle]
 pub extern "C" fn ethercrab_check_mailbox(slave_index: u16, mailbox_status_addr: u16) -> c_int {
+    // If network is unhealthy, skip IO to avoid lock contention
+    if !NETWORK_HEALTHY.load(Ordering::Relaxed) {
+        return -1;
+    }
+
+    // We don't need manual timeouts here as PDU timeouts are handled by ethercrab
+
     let result = smol::block_on(async move {
-        let guard = STATE.lock();
+        let guard = STATE.read();
         if let Some(ref master_state) = *guard {
-             let maindevice = &master_state.maindevice;
-             let idx = slave_index as usize;
-             
-             // Check we have a group
-             if master_state.group.is_none() { return Err(-1); }
-             
-             let val_res = match master_state.group.as_ref().unwrap() {
-                 GroupState::PreOp(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
-                 GroupState::SafeOp(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
-                 GroupState::Op(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
-             };
-             
-             match val_res {
-                 Ok(val) => Ok(if (val & 0x08) != 0 { 1 } else { 0 }),
-                 Err(_) => Err(-2)
-             }
+                let maindevice = &master_state.maindevice;
+                let idx = slave_index as usize;
+                
+                // Check we have a group
+                if master_state.group.is_none() { return Err(-1); }
+                
+                let val_res = match master_state.group.as_ref().unwrap() {
+                    GroupState::PreOp(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
+                    GroupState::SafeOp(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
+                    GroupState::Op(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
+                };
+                
+                match val_res {
+                    Ok(val) => Ok(if (val & 0x08) != 0 { 1 } else { 0 }),
+                    Err(_) => Err(-2)
+                }
         } else {
             Err(-1)
         }
@@ -863,8 +910,15 @@ pub extern "C" fn ethercrab_check_mailbox_resilient(
     mailbox_status_addr: u16,
     last_toggle_bit: u8, // 0 or 1. If > 1, ignore toggle check (first run)
 ) -> c_int {
+    // If network is unhealthy, skip IO to avoid lock contention
+    if !NETWORK_HEALTHY.load(Ordering::Relaxed) {
+        return -1;
+    }
+
+    // Timeout is handled internally by ethercrab
+
     let result = smol::block_on(async move {
-        let guard = STATE.lock();
+        let guard = STATE.read();
         if let Some(ref master_state) = *guard {
             let maindevice = &master_state.maindevice;
             let idx = slave_index as usize;
@@ -934,18 +988,14 @@ pub extern "C" fn ethercrab_check_mailbox_resilient(
 pub extern "C" fn ethercrab_get_last_emergency(out: *mut EmergencyInfo) -> c_int {
     if out.is_null() { return -1; }
 
-    let guard = STATE.lock();
-    if let Some(state) = guard.as_ref() {
-        if let Some(ref emergency) = state.last_emergency {
-            unsafe {
-                (*out).slave_index = emergency.slave_index;
-                (*out).error_code = emergency.error_code;
-                (*out).error_register = emergency.error_register;
-            }
-            0
-        } else {
-            -1
+    let guard = LAST_EMERGENCY.lock();
+    if let Some(ref emergency) = *guard {
+        unsafe {
+            (*out).slave_index = emergency.slave_index;
+            (*out).error_code = emergency.error_code;
+            (*out).error_register = emergency.error_register;
         }
+        0
     } else {
         -1
     }
@@ -958,7 +1008,7 @@ pub extern "C" fn ethercrab_write_process_data_byte(
     value: u8,
 ) -> c_int {
     let result = smol::block_on(async {
-        let mut guard = STATE.lock();
+        let mut guard = STATE.write();
         let state = match guard.as_mut() {
             Some(s) => s,
             None => return 0,
@@ -990,7 +1040,7 @@ pub extern "C" fn ethercrab_read_process_data_byte(
     is_output: bool,
 ) -> u8 {
     let result = smol::block_on(async {
-        let guard = STATE.lock();
+        let guard = STATE.read();
         let state = match guard.as_ref() {
             Some(s) => s,
             None => return 0,
@@ -1033,7 +1083,7 @@ pub extern "C" fn ethercrab_register_read_u16(
     register_address: u16,
 ) -> i32 {
     let result = smol::block_on(async move {
-        let guard = STATE.lock();
+        let guard = STATE.read();
         let state = match guard.as_ref() {
             Some(s) => s,
             None => return Err(-1),
@@ -1077,7 +1127,7 @@ pub extern "C" fn ethercrab_register_write_u16(
     value: u16,
 ) -> i32 {
     let result = smol::block_on(async move {
-        let guard = STATE.lock();
+        let guard = STATE.read();
         let state = match guard.as_ref() {
             Some(s) => s,
             None => return Err(-1),
@@ -1110,7 +1160,8 @@ pub extern "C" fn ethercrab_register_write_u16(
 
 #[no_mangle]
 pub extern "C" fn ethercrab_destroy() {
-    *STATE.lock() = None;
+    *STATE.write() = None;
+    *LAST_EMERGENCY.lock() = None;
 }
 // --- Discovery FFI ---
 
@@ -1406,7 +1457,7 @@ pub extern "C" fn ethercrab_scan_new(interface: *const c_char) -> *mut ScanConte
     if interface.is_null() { return std::ptr::null_mut(); }
 
     // Check global state lock to avoid hardware resource conflict
-    if STATE.lock().is_some() {
+    if STATE.read().is_some() {
         return std::ptr::null_mut();
     }
 

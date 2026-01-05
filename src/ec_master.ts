@@ -32,7 +32,7 @@ import { buildProcessDataMappings } from "./utils/process-data-mapper.ts";
 import { EventEmitter } from "node:events";
 import { join } from "@std/path";
 
-const REQUIRED_FFI_VERSION = "0.1.1";
+const REQUIRED_FFI_VERSION = "0.1.2";
 
 export { AlStatusCode, RegisterAddress, SlaveState };
 export type { EmergencyEvent, EniConfig, StateChangeEvent };

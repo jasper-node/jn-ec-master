@@ -1,5 +1,6 @@
 import { EcMaster, SlaveState } from "../src/ec_master.ts";
 import { loadEniFromXml, parseEniJson } from "../src/utils/eni-loader.ts";
+import { createCycleLoop } from "@controlx-io/cycle-loop";
 
 async function main() {
   // Parse command line arguments
@@ -8,6 +9,7 @@ async function main() {
   const nonFlagArgs = args.filter((arg) => !arg.startsWith("--"));
   const configFile = nonFlagArgs[0];
   const interfaceName = nonFlagArgs[1] || "eth0"; // Default to eth0 if not provided
+  let lastWkc = 0;
 
   if (!configFile) {
     console.error(
@@ -45,7 +47,7 @@ async function main() {
       `Initializing EtherCAT Master on ${eniConfig.master.runtimeOptions.networkInterface}...`,
     );
 
-    const master = new EcMaster(eniConfig);
+    let master = new EcMaster(eniConfig);
 
     // Event handlers
     master.on("stateChange", (event) => {
@@ -63,111 +65,92 @@ async function main() {
     });
 
     try {
-      // Initialize (discovers network, sets up PDI)
-      await master.initialize();
-      console.log("Initialization successful.");
-
-      // Feature 302: Verify topology
-      await master.verifyTopology();
-      console.log("✓ Topology verified");
-
-      // Feature 104: State machine
-      console.log("Requesting PRE_OP...");
-      await master.requestState(SlaveState.PRE_OP);
-      console.log("Requesting SAFE_OP...");
-      await master.requestState(SlaveState.SAFE_OP);
-      console.log("Requesting OP...");
-      await master.requestState(SlaveState.OP);
+      await intiMaster(master);
 
       // Feature 201: Cyclic operation with shared memory
-      const cycleTime = eniConfig.master.cycleTime || 1000;
-      const cycleTimeMs = cycleTime / 1000;
+      const cycleTimeMs = (eniConfig.master.cycleTime || 1000) / 1000;
 
-      console.log(`Starting cyclic loop (cycle time: ${cycleTime}us)...`);
+      console.log(`Starting cyclic loop (cycle time: ${cycleTimeMs}ms)...`);
+
+      let counter = 0;
+      setInterval(() => {
+        console.log(new Date().toISOString(), counter);
+        counter++;
+      }, 1000);
 
       // Example: Find offsets for a specific variable if mapping exists
       // const mapping = master.getMappings().get("MyVariable");
 
-      // Cycle time tracking
-      let cycleCount = 0;
-      let totalCycleTime = 0;
-      let totalIntervalTime = 0;
-      let running = true;
+      // Create cycle loop
+      const cycleController = createCycleLoop({
+        cycleTimeMs: cycleTimeMs,
+        cycleFn: async () => {
+          // Write outputs directly to shared buffer
+          // pdiBuffer[offset] = value;
 
-      // Precise timing loop using busy-wait for better accuracy
-      const runCycleLoop = async () => {
-        let nextCycleTime = performance.now() + cycleTimeMs;
-        let previousCycleStart: number | null = null;
+          // Single FFI call per cycle
+          const wkc = await master.runCycle();
 
-        while (running) {
-          try {
-            const cycleStart = performance.now();
-
-            // Calculate actual interval time (time between cycle starts)
-            if (previousCycleStart !== null) {
-              const actualIntervalTime = cycleStart - previousCycleStart;
-              totalIntervalTime += actualIntervalTime;
-            }
-            previousCycleStart = cycleStart;
-
-            // Write outputs directly to shared buffer
-            // pdiBuffer[offset] = value;
-
-            // Single FFI call per cycle
-            const wkc = await master.runCycle();
-            const cycleEnd = performance.now();
-            const executionTimeMs = cycleEnd - cycleStart;
-
-            // Update average cycle time
-            cycleCount++;
-            totalCycleTime += executionTimeMs;
-            const avgCycleTime = totalCycleTime / cycleCount;
-            const avgIntervalTime = cycleCount > 1 ? totalIntervalTime / (cycleCount - 1) : 0;
-
-            // Read inputs from shared buffer
-            // const val = pdiBuffer[inputOffset];
-
-            // Optional: Print WKC and average cycle time every second roughly
-            if (Math.random() < 0.01) {
-              console.log(
-                `Cycle WKC: ${wkc}, Master cycleTime: ${cycleTime}us, Avg actual interval: ${
-                  avgIntervalTime.toFixed(3)
-                }ms, Avg actual cycle time: ${avgCycleTime.toFixed(3)}ms`,
-              );
-            }
-
-            // Calculate next cycle time and busy-wait until then
-            nextCycleTime = await waitUntilNextCycle(nextCycleTime, cycleTimeMs);
-          } catch (e) {
-            console.error("Cycle error:", e);
-            running = false;
-            master.close();
-            Deno.exit(1);
+          // Check for negative WKC which indicates errors or timeouts
+          if (wkc < 0) {
+            lastWkc = wkc;
+            console.warn(new Date().toISOString(), `[Cycle] Warning: Comms lost (WKC: ${wkc})`);
+            return wkc;
           }
-        }
-      };
+
+          if (wkc > 0 && lastWkc < 0) {
+            const stats = cycleController.getStats();
+            console.log(
+              new Date().toISOString(),
+              `[Cycle] Warning: Comms regained (WKC: ${wkc}). Recovering network state...`,
+              `Last execution time: ${stats.lastExecutionTimeMs.toFixed(3)}ms`,
+            );
+            // RECOVERY: Re-initialize to handle power-cycled slaves
+            await intiMaster(master);
+            cycleController.resetStats();
+          }
+
+          lastWkc = wkc;
+
+          // Optional: Print WKC and average cycle time every second roughly
+          const stats = cycleController.getStats();
+          if (stats.cycleCount % 100 === 0 || (wkc > 0 && lastWkc < 0)) {
+            console.log(
+              `Cycle WKC: ${wkc}, Avg actual cycle time: ${stats.avgExecutionTimeMs.toFixed(3)}ms`,
+            );
+          }
+
+          return wkc;
+        },
+        onError: (error) => {
+          console.error("Cycle error:", error);
+          cycleController.stop();
+          master.close();
+          Deno.exit(1);
+        },
+      });
 
       // Start the cycle loop
-      runCycleLoop();
+      cycleController.start();
 
       // Handle Ctrl+C to exit gracefully
       Deno.addSignalListener("SIGINT", () => {
         console.log("\nStopping...");
-        running = false;
+        cycleController.stop();
         master.requestState(SlaveState.INIT).then(() => {
           master.close();
           Deno.exit(0);
         });
       });
 
-      // Stop after 30 seconds
+      // Stop after 15 seconds
       setTimeout(async () => {
-        console.log("Stopping after 30 seconds...");
-        running = false;
+        console.log("Stopping after 15 seconds...");
+        cycleController.stop();
         await master.requestState(SlaveState.INIT);
         master.close();
         Deno.exit(0);
-      }, 30000);
+      }, 15000);
     } catch (error) {
       if (error instanceof Error) {
         if (error.message.includes("Topology mismatch")) {
@@ -201,54 +184,24 @@ async function main() {
   }
 }
 
-/**
- * Waits until the next cycle time using precise timing.
- * For short waits (<1ms), uses busy-wait for precision.
- * For longer waits, uses setTimeout with busy-wait fine-tuning.
- * Returns the updated next cycle time.
- */
-async function waitUntilNextCycle(
-  nextCycleTime: number,
-  cycleTimeMs: number,
-): Promise<number> {
-  nextCycleTime += cycleTimeMs;
-  const now = performance.now();
-  const waitTime = nextCycleTime - now;
-
-  if (waitTime > 0) {
-    // For short waits, use busy-wait for precision
-    // For longer waits, yield to event loop
-    if (waitTime < 1) {
-      // Busy-wait for sub-millisecond precision
-      while (performance.now() < nextCycleTime) {
-        // Busy wait
-      }
-    } else {
-      // For longer waits, use setTimeout but adjust for precision
-      await new Promise((resolve) => {
-        const start = performance.now();
-        setTimeout(() => {
-          // Fine-tune with busy-wait for the remaining time
-          const elapsed = performance.now() - start;
-          const remaining = waitTime - elapsed;
-          if (remaining > 0) {
-            const target = performance.now() + remaining;
-            while (performance.now() < target) {
-              // Busy wait
-            }
-          }
-          resolve(undefined);
-        }, Math.max(0, waitTime - 0.5)); // Leave 0.5ms for busy-wait
-      });
-    }
-  } else {
-    // We're behind schedule, adjust next cycle time
-    nextCycleTime = performance.now() + cycleTimeMs;
-  }
-
-  return nextCycleTime;
-}
-
 if (import.meta.main) {
   await main();
+}
+
+async function intiMaster(master: EcMaster) {
+  // Initialize (discovers network, sets up PDI)
+  await master.initialize();
+  console.log("Initialization successful.");
+
+  // Feature 302: Verify topology
+  await master.verifyTopology();
+  console.log("✓ Topology verified");
+
+  // Feature 104: State machine
+  console.log("Requesting PRE_OP...");
+  await master.requestState(SlaveState.PRE_OP);
+  console.log("Requesting SAFE_OP...");
+  await master.requestState(SlaveState.SAFE_OP);
+  console.log("Requesting OP...");
+  await master.requestState(SlaveState.OP);
 }
