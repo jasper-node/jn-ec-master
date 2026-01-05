@@ -47,7 +47,7 @@ async function main() {
       `Initializing EtherCAT Master on ${eniConfig.master.runtimeOptions.networkInterface}...`,
     );
 
-    let master = new EcMaster(eniConfig);
+    const master = new EcMaster(eniConfig);
 
     // Event handlers
     master.on("stateChange", (event) => {

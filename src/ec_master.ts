@@ -32,8 +32,6 @@ import { buildProcessDataMappings } from "./utils/process-data-mapper.ts";
 import { EventEmitter } from "node:events";
 import { join } from "@std/path";
 
-const REQUIRED_FFI_VERSION = "0.1.2";
-
 export { AlStatusCode, RegisterAddress, SlaveState };
 export type { EmergencyEvent, EniConfig, StateChangeEvent };
 
@@ -87,6 +85,9 @@ export class EcMaster extends EventEmitter {
   private mailboxToggleBits: Map<number, number> = new Map(); // slaveIndex -> 0 or 1
   private emergencyPollingInterval?: number; // Timer ID
   private lastEmergencySlave: Map<number, EmergencyEvent> = new Map(); // Track per-slave
+
+  private isClosed = false;
+  static REQUIRED_FFI_VERSION = "0.1.2";
 
   // FAULT TOLERANCE CONFIGURATION
   // 5 consecutive timeouts @ 20ms cycle = 100ms "Ride Through" duration

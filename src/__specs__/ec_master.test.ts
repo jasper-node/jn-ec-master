@@ -422,8 +422,7 @@ const mockSymbols = {
   ethercrab_scan_free: () => {},
   ethercrab_destroy: () => {},
   ethercrab_version: (buf: Uint8Array, _len: number) => {
-    const version = "0.1.1";
-    const encoded = new TextEncoder().encode(version);
+    const encoded = new TextEncoder().encode(EcMaster.REQUIRED_FFI_VERSION);
     buf.set(encoded);
     return encoded.length;
   },
@@ -572,8 +571,7 @@ const createCycleMockSymbols = (cyclicTxRxFn: () => number) => ({
     return encoded.length;
   },
   ethercrab_version: (buf: Uint8Array, _len: number) => {
-    const version = "0.1.1";
-    const encoded = new TextEncoder().encode(version);
+    const encoded = new TextEncoder().encode(EcMaster.REQUIRED_FFI_VERSION);
     buf.set(encoded);
     return encoded.length;
   },
