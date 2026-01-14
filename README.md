@@ -12,7 +12,7 @@ Node.js runtimes.
 deno add jsr:@controlx-io/jn-ec-master
 # the binaries are NOT included in the packaged
 # run the following command to download it to ./lib-jn-ec-master
-deno run --allow-run --allow-net --allow-write --allow-read jsr:@controlx-io/jn-ec-master/scripts/download-binaries.ts
+deno run --allow-run --allow-net --allow-write --allow-read jsr:@controlx-io/jn-ec-master/scripts/download-binaries
 ```
 
 ## Target Applications
