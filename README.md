@@ -25,10 +25,10 @@ While marketing materials often hype "microsecond speeds," the reality of the in
 
 | Application Tier                  | Strict Determinism?     | To use? | Examples                                                          |
 | :-------------------------------- | :---------------------- | :-----: | :---------------------------------------------------------------- |
-| **Tier 1: Motion & Safety**       | **CRITICAL** (<1 ms)    |   ❌    | Robotics, CNC, High-speed packaging, Printing, Optical sorting.   |
-| **Tier 2: Discrete Automation**   | **IMPORTANT** (5–20 ms) |   🟠    | Bottling lines, Conveyors, Assembly stations, Palletizing.        |
-| **Tier 3: Process Control**       | **LOW** (>50 ms)        |   ✅    | Water treatment, HVAC, Chemical mixing, Oil & Gas monitoring.     |
-| **General Industrial & Building** | **VERY LOW** (>500 ms)  |   ✅    | Lighting control, Energy monitoring, HVAC status, Access control. |
+| **Tier 1: Industrial & Building** | **VERY LOW** (>500 ms)  |   ✅    | Lighting control, Energy monitoring, HVAC status, Access control. |
+| **Tier 2: Process Control**       | **LOW** (>50 ms)        |   ✅    | Water treatment, HVAC, Chemical mixing, Oil & Gas monitoring.     |
+| **Tier 3: Discrete Automation**   | **IMPORTANT** (5–20 ms) |   🟠    | Bottling lines, Conveyors, Assembly stations, Palletizing.        |
+| **Tier 4: Motion & Safety**       | **CRITICAL** (<1 ms)    |   ❌    | Robotics, CNC, High-speed packaging, Printing, Optical sorting.   |
 
 **Summary:** Only about **15–20%** of industrial applications (Tier 1) strictly _require_ hard real-time determinism where a 10 ms drift would cause failure. The vast majority (~80%) would continue to run with a 15 ms drift, though Tier 2 applications might suffer from reduced efficiency or throughput.
 
@@ -262,6 +262,23 @@ deno task test:ts
 deno task test
 ```
 
+### Building Release Binaries (CI/CD)
+
+To build and release the FFI binaries for all platforms using GitHub Actions:
+
+1. **Automatic (Recommended):**
+   Push a version tag (e.g., `v1.0.0`) to trigger the build and create a GitHub Release.
+   ```bash
+   git tag v1.0.0
+   git push origin v1.0.0
+   ```
+
+2. **Manual:**
+   Go to **Actions** → **Build and Bundle Binaries** → **Run workflow**.
+   You can optionally provide a version tag (e.g., `v1.0.0`).
+
+The workflow produces a `bundled-binaries` artifact and a GitHub Release with the compiled libraries for macOS, Linux, and Windows.
+
 ## Usage Pattern: The Connector Model
 
 This library is designed to function as an independent **EtherCAT Connector**.
@@ -334,32 +351,6 @@ the library uses `parking_lot::Mutex`.
   polling loop and any concurrent acyclic requests (like SDO writes or status
   checks) can safely access the global master state without race conditions or
   deadlocks.
-
-### CI/CD
-
-Build binaries for all platforms using GitHub Actions:
-
-**Triggers:**
-
-- Automatic on version tags: `git tag v1.0.0 && git push origin v1.0.0`
-- Manual dispatch: Go to **Actions** → **Build and Bundle Binaries** → **Run workflow** (optional: provide version tag like `v1.0.0`)
-
-**Build jobs:**
-
-- `build-macos`: Builds both Intel and Apple Silicon
-- `build-windows`: Builds Windows x86_64 (Npcap SDK available on runner)
-- `build-linux`: Builds both x86_64 and ARM64
-
-**Output:** Final artifact `bundled-binaries` with structure:
-
-```
-libs/
-  linuxA64/libethercrab_ffi.so
-  linux64/libethercrab_ffi.so
-  win64/ethercrab_ffi.dll
-  mac64/libethercrab_ffi.dylib
-  macA64/libethercrab_ffi.dylib
-```
 
 ## Compliance & Architecture
 
