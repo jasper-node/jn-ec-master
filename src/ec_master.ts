@@ -87,7 +87,7 @@ export class EcMaster extends EventEmitter {
   private lastEmergencySlave: Map<number, EmergencyEvent> = new Map(); // Track per-slave
 
   private isClosed = false;
-  static REQUIRED_FFI_VERSION = "0.1.2";
+  static REQUIRED_FFI_VERSION = "0.1.3";
 
   // FAULT TOLERANCE CONFIGURATION
   // 5 consecutive timeouts @ 20ms cycle = 100ms "Ride Through" duration
@@ -202,6 +202,22 @@ export class EcMaster extends EventEmitter {
           const ctxValue = Deno.UnsafePointer.value(ctx);
           if (ctxValue !== 0n) {
             break; // Success, exit loop
+          }
+        }
+
+        // Check for specific errors that should abort retries immediately
+        const errorBuf = new Uint8Array(1024);
+
+        const errorLen = dl.symbols.ethercrab_get_last_error(errorBuf, BigInt(errorBuf.length));
+        if (errorLen > 0) {
+          const errorMsg = new TextDecoder().decode(errorBuf.slice(0, errorLen));
+          // Permission errors are fatal and should not be retried
+          if (
+            errorMsg.includes("Permission denied") || errorMsg.includes("Operation not permitted")
+          ) {
+            throw new Error(
+              `Network discovery failed: ${errorMsg}. (Are you running with sudo/admin privileges?)`,
+            );
           }
         }
 

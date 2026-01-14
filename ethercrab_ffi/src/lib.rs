@@ -300,8 +300,16 @@ pub extern "C" fn ethercrab_init(
                         #[cfg(not(target_os = "windows"))]
                         {
                             // Use tx_rx_task which returns a future, block on it
-                            let task = ethercrab::std::tx_rx_task(&iface, tx, rx).expect("Failed to create tx_rx task");
-                            let _ = smol::block_on(task);
+                            match ethercrab::std::tx_rx_task(&iface, tx, rx) {
+                                Ok(task) => {
+                                    if let Err(e) = smol::block_on(task) {
+                                        set_error(format!("TX/RX loop failed: {}", e));
+                                    }
+                                }
+                                Err(e) => {
+                                    set_error(format!("Failed to create tx_rx task: {}", e));
+                                }
+                            }
                         }
                         
                         #[cfg(target_os = "windows")]
@@ -1495,7 +1503,18 @@ pub extern "C" fn ethercrab_scan_new(interface: *const c_char) -> *mut ScanConte
             
             // Task 1: Network Loop
             let network_fut = async {
-                let _ = ethercrab::std::tx_rx_task(&iface, tx, rx).expect("Scan TX/RX").await;
+                match ethercrab::std::tx_rx_task(&iface, tx, rx) {
+                    Ok(task) => {
+                        if let Err(e) = task.await {
+                            set_error(&format!("Scan network task failed: {}", e));
+                            return Err(-1);
+                        }
+                    },
+                    Err(e) => {
+                        set_error(&format!("Scan TX/RX failed: {}", e));
+                        return Err(-1);
+                    }
+                }
                 // Should not return unless error or cancelled
                 set_error("Scan network task ended unexpectedly");
                 Err(-1) 
