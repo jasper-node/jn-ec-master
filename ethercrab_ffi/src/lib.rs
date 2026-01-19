@@ -10,6 +10,7 @@ use ethercrab::subdevice_group::SubDeviceGroup;
 use once_cell::sync::{Lazy, OnceCell};
 use parking_lot::{Mutex, RwLock};
 use smol;
+use futures_lite::future;
 
 // --- Constants ---
 const MAX_SUBDEVICES: usize = 128;
