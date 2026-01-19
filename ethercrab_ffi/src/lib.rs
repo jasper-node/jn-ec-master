@@ -1670,4 +1670,3 @@ pub extern "C" fn ethercrab_scan_free(ctx: *mut ScanContext) {
         }
     }
 }
-
