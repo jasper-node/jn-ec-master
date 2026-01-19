@@ -87,7 +87,7 @@ export class EcMaster extends EventEmitter {
   private lastEmergencySlave: Map<number, EmergencyEvent> = new Map(); // Track per-slave
 
   private isClosed = false;
-  static REQUIRED_FFI_VERSION = "0.1.3";
+  static REQUIRED_FFI_VERSION = "0.1.4";
 
   // FAULT TOLERANCE CONFIGURATION
   // 5 consecutive timeouts @ 20ms cycle = 100ms "Ride Through" duration
@@ -191,6 +191,7 @@ export class EcMaster extends EventEmitter {
 
       // [Step 2] RETRY LOOP with exponential backoff
       let ctx: Deno.PointerValue | null = null;
+      let lastErrorMsg: string | null = null;
 
       for (let attempt = 0; attempt <= MAX_SCAN_RETRIES; attempt++) {
         // Attempt scan
@@ -208,9 +209,15 @@ export class EcMaster extends EventEmitter {
         // Check for specific errors that should abort retries immediately
         const errorBuf = new Uint8Array(1024);
 
-        const errorLen = dl.symbols.ethercrab_get_last_error(errorBuf, BigInt(errorBuf.length));
+        const errorLen = dl.symbols.ethercrab_get_last_error(
+          errorBuf,
+          BigInt(errorBuf.length),
+        );
         if (errorLen > 0) {
-          const errorMsg = new TextDecoder().decode(errorBuf.slice(0, errorLen));
+          const errorMsg = new TextDecoder().decode(errorBuf.slice(0, errorLen)).trim();
+          if (errorMsg.length > 0) {
+            lastErrorMsg = errorMsg;
+          }
           // Permission errors are fatal and should not be retried
           if (
             errorMsg.includes("Permission denied") || errorMsg.includes("Operation not permitted")
@@ -234,8 +241,11 @@ export class EcMaster extends EventEmitter {
 
           // Log warning only if it's not the very first immediate retry
           if (attempt > 0) {
+            const detail = lastErrorMsg
+              ? `Discovery failed: ${lastErrorMsg}.`
+              : "Discovery lock contention.";
             console.warn(
-              `[EtherCAT] Discovery lock contention. Retrying in ${finalDelay}ms (Attempt ${
+              `[EtherCAT] ${detail} Retrying in ${finalDelay}ms (Attempt ${
                 attempt + 1
               }/${MAX_SCAN_RETRIES})...`,
             );
@@ -247,15 +257,21 @@ export class EcMaster extends EventEmitter {
 
       // Final check: if we still don't have a valid context, throw error
       if (ctx === null || ctx === undefined) {
+        const detail = lastErrorMsg
+          ? ` Last error: ${lastErrorMsg}.`
+          : " The EtherCAT master driver is busy or locked.";
         throw new Error(
-          `Failed to start network scan after ${MAX_SCAN_RETRIES} attempts. The EtherCAT master driver is busy or locked.`,
+          `Failed to start network scan after ${MAX_SCAN_RETRIES} attempts.${detail}`,
         );
       }
 
       const ctxValue = Deno.UnsafePointer.value(ctx);
       if (ctxValue === 0n) {
+        const detail = lastErrorMsg
+          ? ` Last error: ${lastErrorMsg}.`
+          : " The EtherCAT master driver is busy or locked.";
         throw new Error(
-          `Failed to start network scan after ${MAX_SCAN_RETRIES} attempts. The EtherCAT master driver is busy or locked.`,
+          `Failed to start network scan after ${MAX_SCAN_RETRIES} attempts.${detail}`,
         );
       }
 

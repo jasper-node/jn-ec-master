@@ -10,7 +10,6 @@ use ethercrab::subdevice_group::SubDeviceGroup;
 use once_cell::sync::{Lazy, OnceCell};
 use parking_lot::{Mutex, RwLock};
 use smol;
-use futures_lite::future;
 
 // --- Constants ---
 const MAX_SUBDEVICES: usize = 128;
@@ -292,6 +291,24 @@ pub extern "C" fn ethercrab_init(
                 // Spawn the network TX/RX task on a dedicated thread.
                 let _md_clone = maindevice.clone();
                 let iface = interface_str.clone();
+
+                #[cfg(target_os = "windows")]
+                {
+                    // Proactively check if the interface exists to prevent panic in tx_rx_task_blocking
+                    // We must try to OPEN it, not just create the capture builder.
+                    match pcap::Capture::from_device(iface.as_str()) {
+                        Ok(builder) => {
+                            if let Err(e) = builder.open() {
+                                set_error(format!("Failed to open interface '{}': {}", iface, e));
+                                return Err(-2);
+                            }
+                        },
+                        Err(e) => {
+                             set_error(format!("Invalid interface '{}': {}", iface, e));
+                             return Err(-2);
+                        }
+                    }
+                }
                 
                 std::thread::Builder::new()
                     .name("ethercrab-tx-rx".into())
@@ -438,6 +455,10 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
 
     let group_enum = state.group.take(); 
     let maindevice = state.maindevice.clone();
+    // Capture current state values before async block
+    let current_input_size = state.input_size;
+    let current_output_size = state.output_size;
+    let current_expected_wkc = state.expected_wkc;
 
     let result = smol::block_on(async {
         match (target_state, group_enum) {
@@ -468,7 +489,7 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
                 
                 Ok((Some(GroupState::SafeOp(g_safe)), in_sz, out_sz, wkc_count))
             },
-            (2, Some(GroupState::SafeOp(g))) => Ok((Some(GroupState::SafeOp(g)), state.input_size, state.output_size, state.expected_wkc)),
+            (2, Some(GroupState::SafeOp(g))) => Ok((Some(GroupState::SafeOp(g)), current_input_size, current_output_size, current_expected_wkc)),
             (2, Some(GroupState::Op(g))) => {
                 // Op -> SafeOp
                 let g_safe = match g.into_safe_op(&maindevice).await {
@@ -478,47 +499,62 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
                         return Err(-3);
                     }
                 };
-                Ok((Some(GroupState::SafeOp(g_safe)), state.input_size, state.output_size, state.expected_wkc))
+                Ok((Some(GroupState::SafeOp(g_safe)), current_input_size, current_output_size, current_expected_wkc))
             },
             
             // To Op (3)
             (3, Some(GroupState::SafeOp(g))) => {
-                let g_op = g.into_op(&maindevice).await.map_err(|e| {
-                    set_error(format!("into_op failed: {:?}", e));
-                    -3
-                })?;
-                Ok((Some(GroupState::Op(g_op)), state.input_size, state.output_size, state.expected_wkc))
+                let g_op = match g.into_op(&maindevice).await {
+                    Ok(g) => g,
+                    Err(e) => {
+                        set_error(format!("into_op failed: {:?}", e));
+                        return Err(-3);
+                    }
+                };
+                Ok((Some(GroupState::Op(g_op)), current_input_size, current_output_size, current_expected_wkc))
             },
-            (3, Some(GroupState::Op(g))) => Ok((Some(GroupState::Op(g)), state.input_size, state.output_size, state.expected_wkc)),
+            (3, Some(GroupState::Op(g))) => Ok((Some(GroupState::Op(g)), current_input_size, current_output_size, current_expected_wkc)),
             
             // To PreOp (1) or Init (0)
             (0 | 1, Some(g_any)) => {
                  match g_any {
                      GroupState::PreOp(g) => Ok((Some(GroupState::PreOp(g)), 0, 0, 0)),
                      GroupState::SafeOp(g) => {
-                        let g_pre = g.into_pre_op(&maindevice).await.map_err(|e| {
-                            set_error(format!("into_pre_op failed: {:?}", e));
-                            -3
-                        })?;
+                        let g_pre = match g.into_pre_op(&maindevice).await {
+                            Ok(g) => g,
+                            Err(e) => {
+                                set_error(format!("into_pre_op failed: {:?}", e));
+                                return Err(-3);
+                            }
+                        };
                         Ok((Some(GroupState::PreOp(g_pre)), 0, 0, 0))
                      },
                      GroupState::Op(g) => {
                         // Op -> SafeOp -> PreOp
-                        let g_safe = g.into_safe_op(&maindevice).await.map_err(|e| {
-                            set_error(format!("into_safe_op failed: {:?}", e));
-                            -3
-                        })?;
-                        let g_pre = g_safe.into_pre_op(&maindevice).await.map_err(|e| {
-                            set_error(format!("into_pre_op failed: {:?}", e));
-                            -3
-                        })?;
+                        let g_safe = match g.into_safe_op(&maindevice).await {
+                            Ok(g) => g,
+                            Err(e) => {
+                                set_error(format!("into_safe_op failed: {:?}", e));
+                                return Err(-3);
+                            }
+                        };
+                        let g_pre = match g_safe.into_pre_op(&maindevice).await {
+                            Ok(g) => g,
+                            Err(e) => {
+                                set_error(format!("into_pre_op failed: {:?}", e));
+                                return Err(-3);
+                            }
+                        };
                         Ok((Some(GroupState::PreOp(g_pre)), 0, 0, 0))
                      }
                  }
             },
             
-            // Invalid Transitions
-            (_, Some(g)) => Ok((Some(g), state.input_size, state.output_size, state.expected_wkc)), 
+            // Invalid Transitions - return the group as-is since no transition was attempted
+            (_, Some(g)) => {
+                // Return the original group and current state values since no transition occurred
+                Ok((Some(g), current_input_size, current_output_size, current_expected_wkc))
+            }, 
 
             (_, None) => {
                 set_error("No group available for state transition");
@@ -536,7 +572,12 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
             state.expected_wkc = wkc;
             0
         },
-        Err(e) => e
+        Err(e) => {
+            // Note: If a transition fails, the group is lost (consumed by the failed operation)
+            // This is a limitation of the ethercrab API - we cannot recover the group after a failed transition
+            // However, we ensure that for invalid transitions (no-op cases), the group is restored above
+            e
+        }
     }
 }
 
@@ -742,7 +783,13 @@ pub extern "C" fn ethercrab_sdo_read(
             }
         }
 
-        read_sdo(state.group.as_ref().unwrap(), &state.maindevice, idx, index, sub_index).await
+        match state.group.as_ref() {
+            Some(group) => read_sdo(group, &state.maindevice, idx, index, sub_index).await,
+            None => {
+                set_error("No group available for SDO read");
+                Err(-2)
+            }
+        }
     });
 
     match result {
@@ -777,7 +824,13 @@ pub extern "C" fn ethercrab_sdo_write(
     let result = smol::block_on(async {
         let idx = slave_index as usize;
         let md = &state.maindevice;
-        let g = state.group.as_ref().unwrap();
+        let g = match state.group.as_ref() {
+            Some(g) => g,
+            None => {
+                set_error("No group available for SDO write");
+                return Err(-2);
+            }
+        };
         
         match len {
             1 => match g {
@@ -831,7 +884,15 @@ pub extern "C" fn ethercrab_eeprom_read(
         let md = &state.maindevice;
         let mut buffer = vec![0u8; len];
         
-        let read_res = match state.group.as_ref().unwrap() {
+        let group = match state.group.as_ref() {
+            Some(g) => g,
+            None => {
+                set_error("No group available for EEPROM read");
+                return Err(-2);
+            }
+        };
+        
+        let read_res = match group {
             GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.eeprom_read_raw(md, address, &mut buffer).await,
             GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.eeprom_read_raw(md, address, &mut buffer).await,
             GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.eeprom_read_raw(md, address, &mut buffer).await,
@@ -886,9 +947,12 @@ pub extern "C" fn ethercrab_check_mailbox(slave_index: u16, mailbox_status_addr:
                 let idx = slave_index as usize;
                 
                 // Check we have a group
-                if master_state.group.is_none() { return Err(-1); }
+                let group = match master_state.group.as_ref() {
+                    Some(g) => g,
+                    None => return Err(-1),
+                };
                 
-                let val_res = match master_state.group.as_ref().unwrap() {
+                let val_res = match group {
                     GroupState::PreOp(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
                     GroupState::SafeOp(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
                     GroupState::Op(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
@@ -932,14 +996,15 @@ pub extern "C" fn ethercrab_check_mailbox_resilient(
             let idx = slave_index as usize;
 
             // Check we have a group
-            if master_state.group.is_none() {
-                return Err(-1);
-            }
+            let group = match master_state.group.as_ref() {
+                Some(g) => g,
+                None => return Err(-1),
+            };
 
             // Retry Loop (Resilient Layer) - max 3 attempts
             for _attempt in 0..3 {
                 // 1. Read Register
-                let val_res = match master_state.group.as_ref().unwrap() {
+                let val_res = match group {
                     GroupState::PreOp(g) => {
                         g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await
                     }
@@ -1550,6 +1615,21 @@ pub extern "C" fn ethercrab_scan_new(interface: *const c_char) -> *mut ScanConte
             );
             
             let iface = interface_str.clone();
+
+            // Proactively check if the interface exists to prevent panic in tx_rx_task_blocking
+            match pcap::Capture::from_device(iface.as_str()) {
+                Ok(builder) => {
+                    if let Err(e) = builder.open() {
+                        set_error(format!("Failed to open interface '{}', try using NPF IDs. {}", iface, e));
+                        return Err(-1);
+                    }
+                },
+                Err(e) => {
+                        set_error(format!("Invalid interface '{}', try using NPF IDs. {}", iface, e));
+                        return Err(-1);
+                }
+            }
+
              std::thread::spawn(move || {
                  let _ = ethercrab::std::tx_rx_task_blocking(&iface, tx, rx, ethercrab::std::TxRxTaskConfig { spinloop: false });
              });
