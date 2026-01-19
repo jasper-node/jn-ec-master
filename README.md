@@ -207,8 +207,10 @@ const outputValue = master.readPdoByte(1, 0, true);
 
 Run the examples as following:
 
+**Linux/macOS:**
+
 ```bash
-# Discover and dave ENI config
+# Discover and save ENI config
 deno -A --unstable-ffi examples/discover.ts discovered.json eth0
 
 # to read ENI config
@@ -222,6 +224,23 @@ IF=eth0 deno task example:cycle
 
 # 3 phases: Discover, Configure , Cycle
 deno -A --unstable-ffi examples/three_phase_check.ts eth0
+```
+
+**Windows:**
+
+```powershell
+# First, find your interface name (e.g., "Ethernet 1" or "Wi-Fi")
+Get-NetAdapter | Select-Object Name
+
+# Discover and save ENI config (use your actual interface name)
+deno -A --unstable-ffi examples/discover.ts discovered.json "Ethernet 1"
+
+# Cycle with ENI config
+deno run -A --unstable-ffi examples/cycle_eni_config.ts discovered.json "Ethernet 1"
+deno run -A --unstable-ffi examples/cycle_eni_config.ts discovered.json "Ethernet 1" --fast
+
+# 3 phases: Discover, Configure , Cycle
+deno -A --unstable-ffi examples/three_phase_check.ts "Ethernet 1"
 ```
 
 ## Development
