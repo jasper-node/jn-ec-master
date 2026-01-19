@@ -229,18 +229,18 @@ deno -A --unstable-ffi examples/three_phase_check.ts eth0
 **Windows:**
 
 ```powershell
-# First, find your interface name (e.g., "Ethernet 1" or "Wi-Fi")
-Get-NetAdapter | Select-Object Name
+# First, find your interface NPF ID (e.g., "{B92BA925-4484-4E5F-A303-90C440FE9D0A}" or "Wi-Fi")
+Get-NetAdapter | Select-Object Name, InterfaceDescription, InterfaceGuid
 
 # Discover and save ENI config (use your actual interface name)
-deno -A --unstable-ffi examples/discover.ts discovered.json "Ethernet 1"
+deno -A --unstable-ffi examples/discover.ts discovered.json "\Device\NPF_{B92BA925-4484-4E5F-A303-90C440FE9D0A}"
 
 # Cycle with ENI config
-deno run -A --unstable-ffi examples/cycle_eni_config.ts discovered.json "Ethernet 1"
-deno run -A --unstable-ffi examples/cycle_eni_config.ts discovered.json "Ethernet 1" --fast
+deno run -A --unstable-ffi examples/cycle_eni_config.ts discovered.json "\Device\NPF_{B92BA925-4484-4E5F-A303-90C440FE9D0A}"
+deno run -A --unstable-ffi examples/cycle_eni_config.ts discovered.json "\Device\NPF_{B92BA925-4484-4E5F-A303-90C440FE9D0A}" --fast
 
 # 3 phases: Discover, Configure , Cycle
-deno -A --unstable-ffi examples/three_phase_check.ts "Ethernet 1"
+deno -A --unstable-ffi examples/three_phase_check.ts "\Device\NPF_{B92BA925-4484-4E5F-A303-90C440FE9D0A}"
 ```
 
 ## Development
