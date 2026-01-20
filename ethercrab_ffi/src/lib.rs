@@ -483,18 +483,24 @@ pub extern "C" fn ethercrab_init(
                             .stack_size(8 * 1024 * 1024)
                             .spawn(move || {
                                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    // Use tx_rx_task which returns a future, block on it
-                                    let task = ethercrab::std::tx_rx_task(&iface, tx, rx);
-                                    let shutdown_fut = async {
-                                        while !shutdown_clone.load(Ordering::Relaxed) {
-                                            smol::Timer::after(Duration::from_millis(50)).await;
+                                    // Use tx_rx_task which returns a Result<Future, Error>
+                                    match ethercrab::std::tx_rx_task(&iface, tx, rx) {
+                                        Ok(task) => {
+                                            let shutdown_fut = async {
+                                                while !shutdown_clone.load(Ordering::Relaxed) {
+                                                    smol::Timer::after(Duration::from_millis(50)).await;
+                                                }
+                                                Ok(())
+                                            };
+                                            
+                                            match smol::block_on(future::race(task, shutdown_fut)) {
+                                                Ok(_) => {},
+                                                Err(e) => set_error(format!("TX/RX loop failed: {}", e)),
+                                            }
+                                        },
+                                        Err(e) => {
+                                            set_error(format!("Failed to create tx_rx task: {}", e));
                                         }
-                                        Ok(())
-                                    };
-                                    
-                                    match smol::block_on(future::race(task, shutdown_fut)) {
-                                        Ok(_) => {},
-                                        Err(e) => set_error(format!("TX/RX loop failed: {}", e)),
                                     }
                                 }));
 
