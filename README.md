@@ -288,8 +288,8 @@ To build and release the FFI binaries for all platforms using GitHub Actions:
 1. **Automatic (Recommended):**
    Push a version tag (e.g., `v1.0.0`) to trigger the build and create a GitHub Release.
    ```bash
-   git tag v0.1.5-lib
-   git push origin v0.1.5-lib
+   git tag v0.1.6-lib
+   git push origin v0.1.6-lib
    ```
 
 2. **Manual:**
