@@ -87,7 +87,7 @@ export class EcMaster extends EventEmitter {
   private lastEmergencySlave: Map<number, EmergencyEvent> = new Map(); // Track per-slave
 
   private isClosed = false;
-  static REQUIRED_FFI_VERSION = "0.1.5";
+  static REQUIRED_FFI_VERSION = "0.1.6";
 
   // FAULT TOLERANCE CONFIGURATION
   // 5 consecutive timeouts @ 20ms cycle = 100ms "Ride Through" duration
