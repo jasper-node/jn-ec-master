@@ -7,9 +7,10 @@ use ethercrab::{
     subdevice_group::{PreOp, SafeOp, Op},
 };
 use ethercrab::subdevice_group::SubDeviceGroup;
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
 use smol;
+#[cfg(not(target_os = "windows"))]
 use futures_lite::future;
 
 // --- Constants ---
@@ -17,9 +18,6 @@ const MAX_SUBDEVICES: usize = 128;
 const MAX_PDU_DATA: usize = PduStorage::element_size(1100);
 const MAX_FRAMES: usize = 16;
 const MAX_PDI: usize = 4096;
-
-// --- Static Storage ---
-static PDU_STORAGE: PduStorage<MAX_FRAMES, MAX_PDU_DATA> = PduStorage::new();
 
 // --- State Definitions ---
 enum GroupState {
@@ -49,7 +47,7 @@ struct InternalEmergencyInfo {
 
 // --- Global State ---
 static STATE: Lazy<RwLock<Option<EcMasterState>>> = Lazy::new(|| RwLock::new(None));
-static GLOBAL_DEVICE: OnceCell<Arc<MainDevice<'static>>> = OnceCell::new();
+static GLOBAL_DEVICE: Lazy<RwLock<Option<Arc<MainDevice<'static>>>>> = Lazy::new(|| RwLock::new(None));
 static LAST_ERROR: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 static LAST_EMERGENCY: Lazy<Mutex<Option<InternalEmergencyInfo>>> = Lazy::new(|| Mutex::new(None));
 static NETWORK_HEALTHY: AtomicBool = AtomicBool::new(true);
@@ -271,83 +269,95 @@ pub extern "C" fn ethercrab_init(
         // Reset health status
         NETWORK_HEALTHY.store(true, Ordering::Relaxed);
 
-        let maindevice = match GLOBAL_DEVICE.get() {
-            Some(md) => md.clone(),
-            None => {
-                let (tx, rx, pdu_loop) = PDU_STORAGE.try_split().map_err(|_| {
-                    set_error("Failed to split PDU storage - likely already in use");
-                    -3
-                })?;
+        let maindevice = {
+            let guard = GLOBAL_DEVICE.read();
+            if let Some(md) = guard.as_ref() {
+                md.clone()
+            } else {
+                drop(guard); // Release read lock before acquiring write lock
                 
-                let maindevice = Arc::new(MainDevice::new(
-                    pdu_loop,
-                    timeouts,
-                    MainDeviceConfig {
-                        dc_static_sync_iterations: 0,  // Disable DC to avoid timeouts
-                        retry_behaviour: ethercrab::RetryBehaviour::Count(pdu_retries),
-                        ..MainDeviceConfig::default()
-                    },
-                ));
-
-                // Spawn the network TX/RX task on a dedicated thread.
-                let _md_clone = maindevice.clone();
-                let iface = interface_str.clone();
-
-                #[cfg(target_os = "windows")]
-                {
-                    // Proactively check if the interface exists to prevent panic in tx_rx_task_blocking
-                    // We must try to OPEN it, not just create the capture builder.
-                    match pcap::Capture::from_device(iface.as_str()) {
-                        Ok(builder) => {
-                            if let Err(e) = builder.open() {
-                                set_error(format!("Failed to open interface '{}': {}", iface, e));
-                                return Err(-2);
-                            }
-                        },
-                        Err(e) => {
-                             set_error(format!("Invalid interface '{}': {}", iface, e));
-                             return Err(-2);
-                        }
-                    }
-                }
-                
-                std::thread::Builder::new()
-                    .name("ethercrab-tx-rx".into())
-                    .stack_size(8 * 1024 * 1024)
-                    .spawn(move || {
-                        #[cfg(not(target_os = "windows"))]
-                        {
-                            // Use tx_rx_task which returns a future, block on it
-                            match ethercrab::std::tx_rx_task(&iface, tx, rx) {
-                                Ok(task) => {
-                                    if let Err(e) = smol::block_on(task) {
-                                        set_error(format!("TX/RX loop failed: {}", e));
-                                    }
-                                }
-                                Err(e) => {
-                                    set_error(format!("Failed to create tx_rx task: {}", e));
-                                }
-                            }
-                        }
-                        
-                        #[cfg(target_os = "windows")]
-                        {
-                            // Use tx_rx_task_blocking for Windows
-                            let _ = ethercrab::std::tx_rx_task_blocking(
-                                &iface, tx, rx, ethercrab::std::TxRxTaskConfig { spinloop: false }
-                            );
-                        }
-                    })
-                    .map_err(|e| {
-                        set_error(format!("Failed to spawn TX/RX thread: {}", e));
+                // Double-check locking pattern
+                let mut guard = GLOBAL_DEVICE.write();
+                // Check if someone else initialized while we were waiting
+                if let Some(md) = guard.as_ref() {
+                    md.clone()
+                } else {
+                    // Allocate storage on heap and leak to get 'static lifetime
+                    // This allows us to create a new storage on each initialization if needed
+                    let storage = Box::leak(Box::new(PduStorage::<MAX_FRAMES, MAX_PDU_DATA>::new()));
+                    
+                    let (tx, rx, pdu_loop) = storage.try_split().map_err(|_| {
+                        set_error("Failed to split PDU storage - likely already in use");
                         -3
                     })?;
+                    
+                    let maindevice = Arc::new(MainDevice::new(
+                        pdu_loop,
+                        timeouts,
+                        MainDeviceConfig {
+                            dc_static_sync_iterations: 0,  // Disable DC to avoid timeouts
+                            retry_behaviour: ethercrab::RetryBehaviour::Count(pdu_retries),
+                            ..MainDeviceConfig::default()
+                        },
+                    ));
 
-                if GLOBAL_DEVICE.set(maindevice.clone()).is_err() {
-                    set_error("Global device already initialized");
-                    return Err(-3);
+                    // Spawn the network TX/RX task on a dedicated thread.
+                    let _md_clone = maindevice.clone();
+                    let iface = interface_str.clone();
+
+                    #[cfg(target_os = "windows")]
+                    {
+                        // Proactively check if the interface exists to prevent panic in tx_rx_task_blocking
+                        // We must try to OPEN it, not just create the capture builder.
+                        match pcap::Capture::from_device(iface.as_str()) {
+                            Ok(builder) => {
+                                if let Err(e) = builder.open() {
+                                    set_error(format!("Failed to open interface '{}': {}", iface, e));
+                                    return Err(-2);
+                                }
+                            },
+                            Err(e) => {
+                                 set_error(format!("Invalid interface '{}': {}", iface, e));
+                                 return Err(-2);
+                            }
+                        }
+                    }
+                    
+                    std::thread::Builder::new()
+                        .name("ethercrab-tx-rx".into())
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            #[cfg(not(target_os = "windows"))]
+                            {
+                                // Use tx_rx_task which returns a future, block on it
+                                match ethercrab::std::tx_rx_task(&iface, tx, rx) {
+                                    Ok(task) => {
+                                        if let Err(e) = smol::block_on(task) {
+                                            set_error(format!("TX/RX loop failed: {}", e));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        set_error(format!("Failed to create tx_rx task: {}", e));
+                                    }
+                                }
+                            }
+                            
+                            #[cfg(target_os = "windows")]
+                            {
+                                // Use tx_rx_task_blocking for Windows
+                                let _ = ethercrab::std::tx_rx_task_blocking(
+                                    &iface, tx, rx, ethercrab::std::TxRxTaskConfig { spinloop: false }
+                                );
+                            }
+                        })
+                        .map_err(|e| {
+                            set_error(format!("Failed to spawn TX/RX thread: {}", e));
+                            -3
+                        })?;
+
+                    *guard = Some(maindevice.clone());
+                    maindevice
                 }
-                maindevice
             }
         };
 
@@ -1235,6 +1245,7 @@ pub extern "C" fn ethercrab_register_write_u16(
 #[no_mangle]
 pub extern "C" fn ethercrab_destroy() {
     *STATE.write() = None;
+    *GLOBAL_DEVICE.write() = None;
     *LAST_EMERGENCY.lock() = None;
 }
 // --- Discovery FFI ---
