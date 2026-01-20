@@ -486,11 +486,15 @@ pub extern "C" fn ethercrab_init(
                                     // Use tx_rx_task which returns a Result<Future, Error>
                                     match ethercrab::std::tx_rx_task(&iface, tx, rx) {
                                         Ok(task) => {
+                                            // Map task output to () so types match with shutdown_fut
+                                            let task = async move {
+                                                task.await.map(|_| ())
+                                            };
                                             let shutdown_fut = async {
                                                 while !shutdown_clone.load(Ordering::Relaxed) {
                                                     smol::Timer::after(Duration::from_millis(50)).await;
                                                 }
-                                                Ok(())
+                                                Ok::<(), ethercrab::error::Error>(())
                                             };
                                             
                                             match smol::block_on(future::race(task, shutdown_fut)) {
