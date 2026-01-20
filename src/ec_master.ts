@@ -1304,7 +1304,9 @@ export class EcMaster extends EventEmitter {
 
   // Cleanup
   close(): void {
+    if (this.isClosed) return;
     this.isClosed = true;
+
     this.stopMailboxPolling();
     this.stopEmergencyPolling();
     try {
@@ -1312,8 +1314,10 @@ export class EcMaster extends EventEmitter {
     } catch (_) {
       // ignore
     }
+
     this.dl.close();
     this.pdiBuffer = null;
+    this.pdiView = null;
   }
 
   private getLastError(): string {

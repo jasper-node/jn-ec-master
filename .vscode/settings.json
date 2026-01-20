@@ -17,8 +17,11 @@
   ],
   "deno.envFile": ".env",
   "cSpell.words": [
+    "dylib",
     "Ethercat",
     "libc",
+    "libethercrab",
+    "LREAL",
     "maindevice",
     "repr",
     "smol",

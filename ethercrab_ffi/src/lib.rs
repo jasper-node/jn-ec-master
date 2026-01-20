@@ -1,7 +1,9 @@
 use std::ffi::{CStr, c_char, c_int};
+use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use std::thread::JoinHandle;
 use ethercrab::{
     MainDevice, MainDeviceConfig, PduStorage, Timeouts, std::ethercat_now,
     subdevice_group::{PreOp, SafeOp, Op},
@@ -36,7 +38,17 @@ struct EcMasterState {
     output_size: usize,
     expected_wkc: u16,
     mailbox_poll_interval_ms: Option<u32>,
+    // Resources for cleanup
+    tx_rx_thread: Option<JoinHandle<()>>,
+    storage_ptr: usize,
+    shutdown_signal: Arc<AtomicBool>,
 }
+
+// SAFETY: EcMasterState is only accessed through RwLock<Option<...>> 
+// which provides synchronization. The storage_ptr is only used during
+// init (single-threaded) and destroy (after thread join).
+unsafe impl Send for EcMasterState {}
+unsafe impl Sync for EcMasterState {}
 
 #[derive(Clone, Copy)]
 struct InternalEmergencyInfo {
@@ -55,6 +67,29 @@ static NETWORK_HEALTHY: AtomicBool = AtomicBool::new(true);
 fn set_error(err: impl std::fmt::Display) {
     let mut guard = LAST_ERROR.lock();
     *guard = err.to_string();
+}
+
+fn panic_message(panic: Box<dyn Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+fn with_ffi_guard<T, F>(default: T, f: F) -> T
+where
+    F: FnOnce() -> T + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(f) {
+        Ok(value) => value,
+        Err(panic) => {
+            set_error(format!("FFI panic: {}", panic_message(panic)));
+            default
+        }
+    }
 }
 
 // --- FFI Structs ---
@@ -152,74 +187,80 @@ fn store_emergency(_state: &mut EcMasterState, slave_index: u16, error_code: u16
 
 #[no_mangle]
 pub extern "C" fn ethercrab_version(buffer: *mut u8, len: usize) -> c_int {
-    let version = env!("CARGO_PKG_VERSION");
-    let version_bytes = version.as_bytes();
-    if buffer.is_null() || len == 0 {
-        return version_bytes.len() as c_int;
-    }
-    let to_copy = version_bytes.len().min(len);
-    unsafe {
-        std::ptr::copy_nonoverlapping(version_bytes.as_ptr(), buffer, to_copy);
-    }
-    to_copy as c_int
+    with_ffi_guard(0, || {
+        let version = env!("CARGO_PKG_VERSION");
+        let version_bytes = version.as_bytes();
+        if buffer.is_null() || len == 0 {
+            return version_bytes.len() as c_int;
+        }
+        let to_copy = version_bytes.len().min(len);
+        unsafe {
+            std::ptr::copy_nonoverlapping(version_bytes.as_ptr(), buffer, to_copy);
+        }
+        to_copy as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn ethercrab_get_last_error(buffer: *mut u8, len: usize) -> c_int {
-    if buffer.is_null() || len == 0 {
-        return 0;
-    }
-    let guard = LAST_ERROR.lock();
-    let error_bytes = guard.as_bytes();
-    let to_copy = error_bytes.len().min(len);
-    unsafe {
-        std::ptr::copy_nonoverlapping(error_bytes.as_ptr(), buffer, to_copy);
-    }
-    to_copy as c_int
+    with_ffi_guard(0, || {
+        if buffer.is_null() || len == 0 {
+            return 0;
+        }
+        let guard = LAST_ERROR.lock();
+        let error_bytes = guard.as_bytes();
+        let to_copy = error_bytes.len().min(len);
+        unsafe {
+            std::ptr::copy_nonoverlapping(error_bytes.as_ptr(), buffer, to_copy);
+        }
+        to_copy as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn is_raw_socket_available() -> c_int {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let fd = libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 0);
-        if fd >= 0 { 
-            libc::close(fd); 
-            return 1; 
+    with_ffi_guard(0, || {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let fd = libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 0);
+            if fd >= 0 { 
+                libc::close(fd); 
+                return 1; 
+            }
+            return 0;
         }
-        return 0;
-    }
 
-    #[cfg(target_os = "macos")]
-    unsafe {
-        for i in 0..256 {
-            let dev = format!("/dev/bpf{}\0", i);
-            match libc::open(dev.as_ptr() as *const libc::c_char, libc::O_RDWR | libc::O_NONBLOCK) {
-                -1 => continue,
-                fd => {
-                    libc::close(fd);
-                    return 1;
+        #[cfg(target_os = "macos")]
+        unsafe {
+            for i in 0..256 {
+                let dev = format!("/dev/bpf{}\0", i);
+                match libc::open(dev.as_ptr() as *const libc::c_char, libc::O_RDWR | libc::O_NONBLOCK) {
+                    -1 => continue,
+                    fd => {
+                        libc::close(fd);
+                        return 1;
+                    }
                 }
             }
+            return 0;
         }
-        return 0;
-    }
-    
-    #[cfg(target_os = "windows")]
-    {
-        use pnet_datalink;
-        let interfaces = pnet_datalink::interfaces();
-        if interfaces.is_empty() { return 0; }
-        if let Some(interface) = interfaces.first() {
-             if let Ok(mut cap_builder) = pcap::Capture::from_device(interface.name.as_str()) {
-                 if cap_builder.open().is_ok() { return 1; }
-             }
+        
+        #[cfg(target_os = "windows")]
+        {
+            use pnet_datalink;
+            let interfaces = pnet_datalink::interfaces();
+            if interfaces.is_empty() { return 0; }
+            if let Some(interface) = interfaces.first() {
+                 if let Ok(cap_builder) = pcap::Capture::from_device(interface.name.as_str()) {
+                     if cap_builder.open().is_ok() { return 1; }
+                 }
+            }
+            return 0;
         }
-        return 0;
-    }
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    return 0;
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        return 0;
+    })
 }
 
 #[no_mangle]
@@ -235,78 +276,86 @@ pub extern "C" fn ethercrab_init(
     eeprom_timeout_ms: u64,
     pdu_retries: usize,
 ) -> c_int {
-    if interface.is_null() { return -1; }
-
-    let interface_str = unsafe {
-        match CStr::from_ptr(interface).to_str() {
-            Ok(s) => s.to_string(),
-            Err(e) => {
-                set_error(format!("Invalid interface string: {}", e));
-                return -2;
-            }
+    with_ffi_guard(-1, || {
+        if interface.is_null() { return -1; }
+        
+        // Idempotency check: if already initialized, return 0
+        if STATE.read().is_some() {
+            return 0;
         }
-    };
 
-    let cmds = if !init_commands.is_null() && init_command_count > 0 {
-        unsafe { std::slice::from_raw_parts(init_commands, init_command_count).to_vec() }
-    } else {
-        Vec::new()
-    };
+        let interface_str = unsafe {
+            match CStr::from_ptr(interface).to_str() {
+                Ok(s) => s.to_string(),
+                Err(e) => {
+                    set_error(format!("Invalid interface string: {}", e));
+                    return -2;
+                }
+            }
+        };
 
-    // Build custom Timeouts from parameters
-    let timeouts = Timeouts {
-        pdu: Duration::from_millis(pdu_timeout_ms),
-        state_transition: Duration::from_millis(state_transition_timeout_ms),
-        mailbox_response: Duration::from_millis(mailbox_response_timeout_ms),
-        // Configurable eeprom timeout
-        eeprom: Duration::from_millis(eeprom_timeout_ms),
-        wait_loop_delay: Duration::from_millis(0),
-        mailbox_echo: Duration::from_millis(100),
-    };
+        let cmds = if !init_commands.is_null() && init_command_count > 0 {
+            unsafe { std::slice::from_raw_parts(init_commands, init_command_count).to_vec() }
+        } else {
+            Vec::new()
+        };
 
-    // Run purely on this thread. smol::block_on spins a local executor.
-    let result = smol::block_on(async move {
-        // Reset health status
-        NETWORK_HEALTHY.store(true, Ordering::Relaxed);
+        // Build custom Timeouts from parameters
+        let timeouts = Timeouts {
+            pdu: Duration::from_millis(pdu_timeout_ms),
+            state_transition: Duration::from_millis(state_transition_timeout_ms),
+            mailbox_response: Duration::from_millis(mailbox_response_timeout_ms),
+            // Configurable eeprom timeout
+            eeprom: Duration::from_millis(eeprom_timeout_ms),
+            wait_loop_delay: Duration::from_millis(0),
+            mailbox_echo: Duration::from_millis(100),
+        };
 
-        let maindevice = {
-            let guard = GLOBAL_DEVICE.read();
-            if let Some(md) = guard.as_ref() {
-                md.clone()
-            } else {
-                drop(guard); // Release read lock before acquiring write lock
-                
-                // Double-check locking pattern
-                let mut guard = GLOBAL_DEVICE.write();
-                // Check if someone else initialized while we were waiting
+        // Run purely on this thread. smol::block_on spins a local executor.
+        let result = smol::block_on(async move {
+            // Reset health status
+            NETWORK_HEALTHY.store(true, Ordering::Relaxed);
+
+            #[cfg(target_os = "windows")]
+            let (maindevice, storage_ptr, shutdown_signal, thread_handle) = {
+                let guard = GLOBAL_DEVICE.read();
                 if let Some(md) = guard.as_ref() {
-                    md.clone()
+                    (md.clone(), 0usize, Arc::new(AtomicBool::new(false)), None)
                 } else {
-                    // Allocate storage on heap and leak to get 'static lifetime
-                    // This allows us to create a new storage on each initialization if needed
-                    let storage = Box::leak(Box::new(PduStorage::<MAX_FRAMES, MAX_PDU_DATA>::new()));
-                    
-                    let (tx, rx, pdu_loop) = storage.try_split().map_err(|_| {
-                        set_error("Failed to split PDU storage - likely already in use");
-                        -3
-                    })?;
-                    
-                    let maindevice = Arc::new(MainDevice::new(
-                        pdu_loop,
-                        timeouts,
-                        MainDeviceConfig {
-                            dc_static_sync_iterations: 0,  // Disable DC to avoid timeouts
-                            retry_behaviour: ethercrab::RetryBehaviour::Count(pdu_retries),
-                            ..MainDeviceConfig::default()
-                        },
-                    ));
+                    drop(guard); // Release read lock before acquiring write lock
 
-                    // Spawn the network TX/RX task on a dedicated thread.
-                    let _md_clone = maindevice.clone();
-                    let iface = interface_str.clone();
+                    // Double-check locking pattern
+                    let mut guard = GLOBAL_DEVICE.write();
+                    // Check if someone else initialized while we were waiting
+                    if let Some(md) = guard.as_ref() {
+                        (md.clone(), 0usize, Arc::new(AtomicBool::new(false)), None)
+                    } else {
+                        // Create storage on heap and convert to raw pointer to manage lifetime manually
+                        let storage_box = Box::new(PduStorage::<MAX_FRAMES, MAX_PDU_DATA>::new());
+                        let ptr = Box::into_raw(storage_box);
+                        let storage_ptr_val = ptr as usize;
+                        let storage = unsafe { &mut *ptr };
 
-                    #[cfg(target_os = "windows")]
-                    {
+                        let (mut tx, mut rx, pdu_loop) = storage.try_split().map_err(|_| {
+                            set_error("Failed to split PDU storage - likely already in use");
+                            -3
+                        })?;
+
+                        let maindevice = Arc::new(MainDevice::new(
+                            pdu_loop,
+                            timeouts,
+                            MainDeviceConfig {
+                                dc_static_sync_iterations: 0,  // Disable DC to avoid timeouts
+                                retry_behaviour: ethercrab::RetryBehaviour::Count(pdu_retries),
+                                ..MainDeviceConfig::default()
+                            },
+                        ));
+
+                        // Spawn the network TX/RX task on a dedicated thread.
+                        let iface = interface_str.clone();
+                        let shutdown = Arc::new(AtomicBool::new(false));
+                        let shutdown_clone = shutdown.clone();
+
                         // Proactively check if the interface exists to prevent panic in tx_rx_task_blocking
                         // We must try to OPEN it, not just create the capture builder.
                         match pcap::Capture::from_device(iface.as_str()) {
@@ -321,89 +370,198 @@ pub extern "C" fn ethercrab_init(
                                  return Err(-2);
                             }
                         }
-                    }
-                    
-                    std::thread::Builder::new()
-                        .name("ethercrab-tx-rx".into())
-                        .stack_size(8 * 1024 * 1024)
-                        .spawn(move || {
-                            #[cfg(not(target_os = "windows"))]
-                            {
-                                // Use tx_rx_task which returns a future, block on it
-                                match ethercrab::std::tx_rx_task(&iface, tx, rx) {
-                                    Ok(task) => {
-                                        if let Err(e) = smol::block_on(task) {
-                                            set_error(format!("TX/RX loop failed: {}", e));
+
+                        let handle = std::thread::Builder::new()
+                            .name("ethercrab-tx-rx".into())
+                            .stack_size(8 * 1024 * 1024)
+                            .spawn(move || {
+                                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    // Manual TX/RX loop with shutdown support
+                                    let mut cap = pcap::Capture::from_device(iface.as_str())
+                                        .expect("Device")
+                                        .immediate_mode(true)
+                                        .open()
+                                        .expect("Open device")
+                                        .setnonblock()
+                                        .expect("Can't set non-blocking");
+
+                                    let mut sq = pcap::sendqueue::SendQueue::new(1024 * 1024).expect("Failed to create send queue");
+
+                                    while !shutdown_clone.load(Ordering::Relaxed) {
+                                        let mut sent = 0;
+                                        while let Some(frame) = tx.next_sendable_frame() {
+                                            let _ = frame.send_blocking(|bytes| {
+                                                sq.queue(None, bytes).expect("Enqueue");
+                                                Ok(bytes.len())
+                                            });
+                                            sent += 1;
                                         }
+
+                                        if sent > 0 {
+                                            let _ = sq.transmit(&mut cap, pcap::sendqueue::SendSync::Off);
+                                        }
+
+                                        // Poll for packets (non-blocking)
+                                        // Process up to 16 packets per tick to avoid starving TX
+                                        for _ in 0..16 {
+                                            match cap.next_packet() {
+                                                Ok(packet) => {
+                                                    if let Err(_) = rx.receive_frame(packet.data) {
+                                                        // Ignore errors (malformed/unrelated packets)
+                                                    }
+                                                }
+                                                Err(pcap::Error::NoMorePackets) => break,
+                                                Err(pcap::Error::TimeoutExpired) => break,
+                                                Err(_) => break, // Error or device lost
+                                            }
+                                        }
+                                        
+                                        // Sleep to prevent 100% CPU usage
+                                        std::thread::sleep(Duration::from_millis(1));
                                     }
-                                    Err(e) => {
-                                        set_error(format!("Failed to create tx_rx task: {}", e));
-                                    }
+                                }));
+
+                                if let Err(panic) = result {
+                                    set_error(format!("TX/RX thread panicked: {}", panic_message(panic)));
+                                    NETWORK_HEALTHY.store(false, Ordering::Relaxed);
                                 }
-                            }
-                            
-                            #[cfg(target_os = "windows")]
-                            {
-                                // Use tx_rx_task_blocking for Windows
-                                let _ = ethercrab::std::tx_rx_task_blocking(
-                                    &iface, tx, rx, ethercrab::std::TxRxTaskConfig { spinloop: false }
-                                );
-                            }
-                        })
-                        .map_err(|e| {
-                            set_error(format!("Failed to spawn TX/RX thread: {}", e));
+                            })
+                            .map_err(|e| {
+                                set_error(format!("Failed to spawn TX/RX thread: {}", e));
+                                -3
+                            })?;
+
+                        *guard = Some(maindevice.clone());
+                        
+                        (maindevice, storage_ptr_val, shutdown, Some(handle))
+                    }
+                }
+            };
+
+            #[cfg(not(target_os = "windows"))]
+            let (maindevice, storage_ptr, shutdown_signal, thread_handle) = {
+                let guard = GLOBAL_DEVICE.read();
+                if let Some(md) = guard.as_ref() {
+                    (md.clone(), 0usize, Arc::new(AtomicBool::new(false)), None)
+                } else {
+                    drop(guard); // Release read lock before acquiring write lock
+
+                    // Double-check locking pattern
+                    let mut guard = GLOBAL_DEVICE.write();
+                    // Check if someone else initialized while we were waiting
+                    if let Some(md) = guard.as_ref() {
+                        (md.clone(), 0usize, Arc::new(AtomicBool::new(false)), None)
+                    } else {
+                        // Create storage on heap and convert to raw pointer to manage lifetime manually
+                        let storage_box = Box::new(PduStorage::<MAX_FRAMES, MAX_PDU_DATA>::new());
+                        let ptr = Box::into_raw(storage_box);
+                        let storage_ptr_val = ptr as usize;
+                        let storage = unsafe { &mut *ptr };
+
+                        let (tx, rx, pdu_loop) = storage.try_split().map_err(|_| {
+                            set_error("Failed to split PDU storage - likely already in use");
                             -3
                         })?;
 
-                    *guard = Some(maindevice.clone());
-                    maindevice
+                        let maindevice = Arc::new(MainDevice::new(
+                            pdu_loop,
+                            timeouts,
+                            MainDeviceConfig {
+                                dc_static_sync_iterations: 0,  // Disable DC to avoid timeouts
+                                retry_behaviour: ethercrab::RetryBehaviour::Count(pdu_retries),
+                                ..MainDeviceConfig::default()
+                            },
+                        ));
+
+                        // Spawn the network TX/RX task on a dedicated thread.
+                        let iface = interface_str.clone();
+                        let shutdown = Arc::new(AtomicBool::new(false));
+                        let shutdown_clone = shutdown.clone();
+
+                        let handle = std::thread::Builder::new()
+                            .name("ethercrab-tx-rx".into())
+                            .stack_size(8 * 1024 * 1024)
+                            .spawn(move || {
+                                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    // Use tx_rx_task which returns a future, block on it
+                                    let task = ethercrab::std::tx_rx_task(&iface, tx, rx);
+                                    let shutdown_fut = async {
+                                        while !shutdown_clone.load(Ordering::Relaxed) {
+                                            smol::Timer::after(Duration::from_millis(50)).await;
+                                        }
+                                        Ok(())
+                                    };
+                                    
+                                    match smol::block_on(future::race(task, shutdown_fut)) {
+                                        Ok(_) => {},
+                                        Err(e) => set_error(format!("TX/RX loop failed: {}", e)),
+                                    }
+                                }));
+
+                                if let Err(panic) = result {
+                                    set_error(format!("TX/RX thread panicked: {}", panic_message(panic)));
+                                    NETWORK_HEALTHY.store(false, Ordering::Relaxed);
+                                }
+                            })
+                            .map_err(|e| {
+                                set_error(format!("Failed to spawn TX/RX thread: {}", e));
+                                -3
+                            })?;
+
+                        *guard = Some(maindevice.clone());
+                        
+                        (maindevice, storage_ptr_val, shutdown, Some(handle))
+                    }
+                }
+            };
+
+            // Init Group
+            let group = maindevice.init_single_group::<MAX_SUBDEVICES, MAX_PDI>(ethercat_now)
+                .await.map_err(|e| {
+                    set_error(format!("Failed to init single group: {:?}", e));
+                    -5
+                })?;
+
+
+            // Run Init Commands
+            for cmd in cmds {
+                let slave_idx = cmd.slave_index as usize;
+                if let Some(subdevice) = group.iter(&maindevice).nth(slave_idx) {
+                    let val = u32_from_bytes(cmd.value);
+                    if cmd.command_type == 0 {
+                        let _ = subdevice.sdo_write(cmd.index, cmd.sub_index, val).await;
+                    } else {
+                        let _ = subdevice.register_write(cmd.index, val).await;
+                    }
                 }
             }
-        };
 
-        // Init Group
-        let group = maindevice.init_single_group::<MAX_SUBDEVICES, MAX_PDI>(ethercat_now)
-            .await.map_err(|e| {
-                set_error(format!("Failed to init single group: {:?}", e));
-                -5
-            })?;
+            let pdi_buffer = Arc::new(RwLock::new([0u8; MAX_PDI]));
+            
+            let master_state = EcMasterState {
+                maindevice: maindevice.clone(),
+                group: Some(GroupState::PreOp(group)),
+                pdi_buffer,
+                pdi_size: 0,
+                input_size: 0,
+                output_size: 0,
+                expected_wkc: 0,
+                mailbox_poll_interval_ms: None,
+                tx_rx_thread: thread_handle,
+                storage_ptr,
+                shutdown_signal,
+            };
 
+            let mut guard = STATE.write();
+            *guard = Some(master_state);
+            Ok(0)
+        });
 
-        // Run Init Commands
-        for cmd in cmds {
-            let slave_idx = cmd.slave_index as usize;
-            if let Some(subdevice) = group.iter(&maindevice).nth(slave_idx) {
-                let val = u32_from_bytes(cmd.value);
-                if cmd.command_type == 0 {
-                    let _ = subdevice.sdo_write(cmd.index, cmd.sub_index, val).await;
-                } else {
-                    let _ = subdevice.register_write(cmd.index, val).await;
-                }
-            }
+        match result {
+            Ok(v) => v,
+            Err(e) => e,
         }
-
-        let pdi_buffer = Arc::new(RwLock::new([0u8; MAX_PDI]));
-        
-        let master_state = EcMasterState {
-            maindevice: maindevice.clone(),
-            group: Some(GroupState::PreOp(group)),
-            pdi_buffer,
-            pdi_size: 0,
-            input_size: 0,
-            output_size: 0,
-            expected_wkc: 0,
-            mailbox_poll_interval_ms: None,
-        };
-
-    let mut guard = STATE.write();
-        *guard = Some(master_state);
-        Ok(0)
-    });
-
-    match result {
-        Ok(v) => v,
-        Err(e) => e,
-    }
+    })
 }
 
 #[no_mangle]
@@ -411,341 +569,364 @@ pub extern "C" fn ethercrab_verify_topology(
     expected: *const SlaveIdentity,
     expected_count: usize,
 ) -> c_int {
-    if expected.is_null() || expected_count == 0 { return -1; }
+    with_ffi_guard(-1, || {
+        if expected.is_null() || expected_count == 0 { return -1; }
 
-    let expected_slaves = unsafe { std::slice::from_raw_parts(expected, expected_count) };
-    
-    // We need to access the group to iterate.
-    // We can do this synchronously because we are just reading memory, not doing I/O.
-    let guard = STATE.read();
-    let state = match guard.as_ref() {
-        Some(s) => s,
-        None => return -1,
-    };
+        let expected_slaves = unsafe { std::slice::from_raw_parts(expected, expected_count) };
 
-    // Helper to get group count regardless of state
-    let discovered_count = match &state.group {
-        Some(GroupState::PreOp(g)) => g.len(),
-        Some(GroupState::SafeOp(g)) => g.len(),
-        Some(GroupState::Op(g)) => g.len(),
-        None => return -1,
-    };
-
-    if discovered_count != expected_count { return -1; }
-
-    for (idx, expected_slave) in expected_slaves.iter().enumerate() {
-        let identity = match &state.group {
-            Some(GroupState::PreOp(g)) => g.iter(&state.maindevice).nth(idx).map(|s| s.identity()),
-            Some(GroupState::SafeOp(g)) => g.iter(&state.maindevice).nth(idx).map(|s| s.identity()),
-            Some(GroupState::Op(g)) => g.iter(&state.maindevice).nth(idx).map(|s| s.identity()),
+        // We need to access the group to iterate.
+        // We can do this synchronously because we are just reading memory, not doing I/O.
+        let guard = STATE.read();
+        let state = match guard.as_ref() {
+            Some(s) => s,
             None => return -1,
         };
 
-        if let Some(id) = identity {
-            if id.vendor_id != expected_slave.vendor_id || id.product_id != expected_slave.product_code {
-                return -1;
-            }
-            if expected_slave.serial_number != 0 && id.serial != expected_slave.serial_number {
-                return -1;
-            }
-        } else {
-            return -1;
-        }
-    }
+        // Helper to get group count regardless of state
+        let discovered_count = match &state.group {
+            Some(GroupState::PreOp(g)) => g.len(),
+            Some(GroupState::SafeOp(g)) => g.len(),
+            Some(GroupState::Op(g)) => g.len(),
+            None => return -1,
+        };
 
-    0
+        if discovered_count != expected_count { return -1; }
+
+        for (idx, expected_slave) in expected_slaves.iter().enumerate() {
+            let identity = match &state.group {
+                Some(GroupState::PreOp(g)) => g.iter(&state.maindevice).nth(idx).map(|s| s.identity()),
+                Some(GroupState::SafeOp(g)) => g.iter(&state.maindevice).nth(idx).map(|s| s.identity()),
+                Some(GroupState::Op(g)) => g.iter(&state.maindevice).nth(idx).map(|s| s.identity()),
+                None => return -1,
+            };
+
+            if let Some(id) = identity {
+                if id.vendor_id != expected_slave.vendor_id || id.product_id != expected_slave.product_code {
+                    return -1;
+                }
+                if expected_slave.serial_number != 0 && id.serial != expected_slave.serial_number {
+                    return -1;
+                }
+            } else {
+                return -1;
+            }
+        }
+
+        0
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
-    let mut guard = STATE.write();
-    let state = match guard.as_mut() {
-        Some(s) => s,
-        None => return -1,
-    };
+    with_ffi_guard(-1, || {
+        // If no master is initialized, allow INIT/PRE-OP as a no-op.
+        // This prevents noisy warnings during teardown after failed init.
+        if STATE.read().is_none() {
+            if target_state == 0 || target_state == 1 {
+                return 0;
+            }
+            set_error("No master available for state transition");
+            return -1;
+        }
 
-    let group_enum = state.group.take(); 
-    let maindevice = state.maindevice.clone();
-    // Capture current state values before async block
-    let current_input_size = state.input_size;
-    let current_output_size = state.output_size;
-    let current_expected_wkc = state.expected_wkc;
+        let mut guard = STATE.write();
+        let state = match guard.as_mut() {
+            Some(s) => s,
+            None => return -1,
+        };
 
-    let result = smol::block_on(async {
-        match (target_state, group_enum) {
-            // Init (0) / PreOp (1) handled below
+        let group_enum = state.group.take(); 
+        let maindevice = state.maindevice.clone();
+        // Capture current state values before async block
+        let current_input_size = state.input_size;
+        let current_output_size = state.output_size;
+        let current_expected_wkc = state.expected_wkc;
 
-            
-            // To SafeOp (2)
-            (2, Some(GroupState::PreOp(g))) => {
-                let g_safe = match g.into_safe_op(&maindevice).await {
-                    Ok(g) => g,
-                    Err(e) => {
-                        set_error(format!("into_safe_op failed: {:?}", e));
-                        return Err(-3);
-                    }
-                };
+        let result = smol::block_on(async {
+            match (target_state, group_enum) {
+                // Init (0) / PreOp (1) handled below
+
                 
-                let mut in_sz = 0;
-                let mut out_sz = 0;
-                for slave in g_safe.iter(&maindevice) {
-                    let io = slave.io_raw();
-                    in_sz += io.inputs().len();
-                    out_sz += io.outputs().len();
-                }
-                
-                // WKC counts all slaves in the group, not just those with PDI
-                // This is because the LRW frame passes through all slaves
-                let wkc_count = g_safe.len() as u16;
-                
-                Ok((Some(GroupState::SafeOp(g_safe)), in_sz, out_sz, wkc_count))
-            },
-            (2, Some(GroupState::SafeOp(g))) => Ok((Some(GroupState::SafeOp(g)), current_input_size, current_output_size, current_expected_wkc)),
-            (2, Some(GroupState::Op(g))) => {
-                // Op -> SafeOp
-                let g_safe = match g.into_safe_op(&maindevice).await {
-                    Ok(g) => g,
-                    Err(e) => {
-                        set_error(format!("into_safe_op failed: {:?}", e));
-                        return Err(-3);
+                // To SafeOp (2)
+                (2, Some(GroupState::PreOp(g))) => {
+                    let g_safe = match g.into_safe_op(&maindevice).await {
+                        Ok(g) => g,
+                        Err(e) => {
+                            set_error(format!("into_safe_op failed: {:?}", e));
+                            return Err(-3);
+                        }
+                    };
+                    
+                    let mut in_sz = 0;
+                    let mut out_sz = 0;
+                    for slave in g_safe.iter(&maindevice) {
+                        let io = slave.io_raw();
+                        in_sz += io.inputs().len();
+                        out_sz += io.outputs().len();
                     }
-                };
-                Ok((Some(GroupState::SafeOp(g_safe)), current_input_size, current_output_size, current_expected_wkc))
-            },
-            
-            // To Op (3)
-            (3, Some(GroupState::SafeOp(g))) => {
-                let g_op = match g.into_op(&maindevice).await {
-                    Ok(g) => g,
-                    Err(e) => {
-                        set_error(format!("into_op failed: {:?}", e));
-                        return Err(-3);
-                    }
-                };
-                Ok((Some(GroupState::Op(g_op)), current_input_size, current_output_size, current_expected_wkc))
-            },
-            (3, Some(GroupState::Op(g))) => Ok((Some(GroupState::Op(g)), current_input_size, current_output_size, current_expected_wkc)),
-            
-            // To PreOp (1) or Init (0)
-            (0 | 1, Some(g_any)) => {
-                 match g_any {
-                     GroupState::PreOp(g) => Ok((Some(GroupState::PreOp(g)), 0, 0, 0)),
-                     GroupState::SafeOp(g) => {
-                        let g_pre = match g.into_pre_op(&maindevice).await {
-                            Ok(g) => g,
-                            Err(e) => {
-                                set_error(format!("into_pre_op failed: {:?}", e));
-                                return Err(-3);
-                            }
-                        };
-                        Ok((Some(GroupState::PreOp(g_pre)), 0, 0, 0))
-                     },
-                     GroupState::Op(g) => {
-                        // Op -> SafeOp -> PreOp
-                        let g_safe = match g.into_safe_op(&maindevice).await {
-                            Ok(g) => g,
-                            Err(e) => {
-                                set_error(format!("into_safe_op failed: {:?}", e));
-                                return Err(-3);
-                            }
-                        };
-                        let g_pre = match g_safe.into_pre_op(&maindevice).await {
-                            Ok(g) => g,
-                            Err(e) => {
-                                set_error(format!("into_pre_op failed: {:?}", e));
-                                return Err(-3);
-                            }
-                        };
-                        Ok((Some(GroupState::PreOp(g_pre)), 0, 0, 0))
+                    
+                    // WKC counts all slaves in the group, not just those with PDI
+                    // This is because the LRW frame passes through all slaves
+                    let wkc_count = g_safe.len() as u16;
+                    
+                    Ok((Some(GroupState::SafeOp(g_safe)), in_sz, out_sz, wkc_count))
+                },
+                (2, Some(GroupState::SafeOp(g))) => Ok((Some(GroupState::SafeOp(g)), current_input_size, current_output_size, current_expected_wkc)),
+                (2, Some(GroupState::Op(g))) => {
+                    // Op -> SafeOp
+                    let g_safe = match g.into_safe_op(&maindevice).await {
+                        Ok(g) => g,
+                        Err(e) => {
+                            set_error(format!("into_safe_op failed: {:?}", e));
+                            return Err(-3);
+                        }
+                    };
+                    Ok((Some(GroupState::SafeOp(g_safe)), current_input_size, current_output_size, current_expected_wkc))
+                },
+                
+                // To Op (3)
+                (3, Some(GroupState::SafeOp(g))) => {
+                    let g_op = match g.into_op(&maindevice).await {
+                        Ok(g) => g,
+                        Err(e) => {
+                            set_error(format!("into_op failed: {:?}", e));
+                            return Err(-3);
+                        }
+                    };
+                    Ok((Some(GroupState::Op(g_op)), current_input_size, current_output_size, current_expected_wkc))
+                },
+                (3, Some(GroupState::Op(g))) => Ok((Some(GroupState::Op(g)), current_input_size, current_output_size, current_expected_wkc)),
+                
+                // To PreOp (1) or Init (0)
+                (0 | 1, Some(g_any)) => {
+                     match g_any {
+                         GroupState::PreOp(g) => Ok((Some(GroupState::PreOp(g)), 0, 0, 0)),
+                         GroupState::SafeOp(g) => {
+                            let g_pre = match g.into_pre_op(&maindevice).await {
+                                Ok(g) => g,
+                                Err(e) => {
+                                    set_error(format!("into_pre_op failed: {:?}", e));
+                                    return Err(-3);
+                                }
+                            };
+                            Ok((Some(GroupState::PreOp(g_pre)), 0, 0, 0))
+                         },
+                         GroupState::Op(g) => {
+                            // Op -> SafeOp -> PreOp
+                            let g_safe = match g.into_safe_op(&maindevice).await {
+                                Ok(g) => g,
+                                Err(e) => {
+                                    set_error(format!("into_safe_op failed: {:?}", e));
+                                    return Err(-3);
+                                }
+                            };
+                            let g_pre = match g_safe.into_pre_op(&maindevice).await {
+                                Ok(g) => g,
+                                Err(e) => {
+                                    set_error(format!("into_pre_op failed: {:?}", e));
+                                    return Err(-3);
+                                }
+                            };
+                            Ok((Some(GroupState::PreOp(g_pre)), 0, 0, 0))
+                         }
                      }
-                 }
-            },
-            
-            // Invalid Transitions - return the group as-is since no transition was attempted
-            (_, Some(g)) => {
-                // Return the original group and current state values since no transition occurred
-                Ok((Some(g), current_input_size, current_output_size, current_expected_wkc))
-            }, 
+                },
+                
+                // Invalid Transitions - return the group as-is since no transition was attempted
+                (_, Some(g)) => {
+                    // Return the original group and current state values since no transition occurred
+                    Ok((Some(g), current_input_size, current_output_size, current_expected_wkc))
+                }, 
 
-            (_, None) => {
-                set_error("No group available for state transition");
-                Err(-2)
-            },
-        }
-    });
+                (_, None) => {
+                    set_error("No group available for state transition");
+                    Err(-2)
+                },
+            }
+        });
 
-    match result {
-        Ok((new_group, in_s, out_s, wkc)) => {
-            state.group = new_group;
-            state.input_size = in_s;
-            state.output_size = out_s;
-            state.pdi_size = in_s + out_s;
-            state.expected_wkc = wkc;
-            0
-        },
-        Err(e) => {
-            // Note: If a transition fails, the group is lost (consumed by the failed operation)
-            // This is a limitation of the ethercrab API - we cannot recover the group after a failed transition
-            // However, we ensure that for invalid transitions (no-op cases), the group is restored above
-            e
+        match result {
+            Ok((new_group, in_s, out_s, wkc)) => {
+                state.group = new_group;
+                state.input_size = in_s;
+                state.output_size = out_s;
+                state.pdi_size = in_s + out_s;
+                state.expected_wkc = wkc;
+                0
+            },
+            Err(e) => {
+                // Note: If a transition fails, the group is lost (consumed by the failed operation)
+                // This is a limitation of the ethercrab API - we cannot recover the group after a failed transition
+                // However, we ensure that for invalid transitions (no-op cases), the group is restored above
+                e
+            }
         }
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn ethercrab_get_state() -> u8 {
-    let guard = STATE.read();
-    if let Some(state) = guard.as_ref() {
-        match &state.group {
-            Some(GroupState::PreOp(_)) => 1,
-            Some(GroupState::SafeOp(_)) => 2,
-            Some(GroupState::Op(_)) => 3,
-            None => 0,
+    with_ffi_guard(0, || {
+        let guard = STATE.read();
+        if let Some(state) = guard.as_ref() {
+            match &state.group {
+                Some(GroupState::PreOp(_)) => 1,
+                Some(GroupState::SafeOp(_)) => 2,
+                Some(GroupState::Op(_)) => 3,
+                None => 0,
+            }
+        } else {
+            0
         }
-    } else {
-        0
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn ethercrab_get_al_status_code(slave_index: u16) -> u16 {
-   
-    let result = smol::block_on(async move {
-        let guard = STATE.read();
-        if let Some(ref master_state) = *guard {
-            let maindevice = &master_state.maindevice;
-            let idx = slave_index as usize;
-            
-            let status_result = match &master_state.group {
-                Some(GroupState::PreOp(g)) => {
-                    if let Some(subdevice) = g.iter(maindevice).nth(idx) {
-                        subdevice.status().await
-                    } else {
-                        return Err(0);
+    with_ffi_guard(0, || {
+        let result = smol::block_on(async move {
+            let guard = STATE.read();
+            if let Some(ref master_state) = *guard {
+                let maindevice = &master_state.maindevice;
+                let idx = slave_index as usize;
+                
+                let status_result = match &master_state.group {
+                    Some(GroupState::PreOp(g)) => {
+                        if let Some(subdevice) = g.iter(maindevice).nth(idx) {
+                            subdevice.status().await
+                        } else {
+                            return Err(0);
+                        }
                     }
-                }
-                Some(GroupState::SafeOp(g)) => {
-                    if let Some(subdevice) = g.iter(maindevice).nth(idx) {
-                        subdevice.status().await
-                    } else {
-                        return Err(0);
+                    Some(GroupState::SafeOp(g)) => {
+                        if let Some(subdevice) = g.iter(maindevice).nth(idx) {
+                            subdevice.status().await
+                        } else {
+                            return Err(0);
+                        }
                     }
-                }
-                Some(GroupState::Op(g)) => {
-                    if let Some(subdevice) = g.iter(maindevice).nth(idx) {
-                        subdevice.status().await
-                    } else {
-                        return Err(0);
+                    Some(GroupState::Op(g)) => {
+                        if let Some(subdevice) = g.iter(maindevice).nth(idx) {
+                            subdevice.status().await
+                        } else {
+                            return Err(0);
+                        }
                     }
+                    None => return Err(0),
+                };
+                
+                match status_result {
+                    Ok((_, status_code)) => Ok(u16::from(status_code)),
+                    Err(_) => Err(0),
                 }
-                None => return Err(0),
-            };
-            
-            match status_result {
-                Ok((_, status_code)) => Ok(u16::from(status_code)),
-                Err(_) => Err(0),
+            } else {
+                Err(0)
             }
-        } else {
-            Err(0)
-        }
-    });
+        });
 
-    match result {
-        Ok(code) => code,
-        Err(_) => 0,
-    }
+        match result {
+            Ok(code) => code,
+            Err(_) => 0,
+        }
+    })
 }
 
 /// Returns the PDI buffer pointer directly.
 /// Note: Deno FFI doesn't correctly marshal pointers in struct returns, so we use separate functions.
 #[no_mangle]
 pub extern "C" fn ethercrab_get_pdi_buffer_ptr() -> *mut u8 {
-    let guard = STATE.read();
-    if let Some(state) = guard.as_ref() {
-        let buf_guard = state.pdi_buffer.read();
-        let ptr = buf_guard.as_ptr() as *mut u8;
-        drop(buf_guard);
-        ptr
-    } else {
-        std::ptr::null_mut()
-    }
+    with_ffi_guard(std::ptr::null_mut(), || {
+        let guard = STATE.read();
+        if let Some(state) = guard.as_ref() {
+            let buf_guard = state.pdi_buffer.read();
+            let ptr = buf_guard.as_ptr() as *mut u8;
+            drop(buf_guard);
+            ptr
+        } else {
+            std::ptr::null_mut()
+        }
+    })
 }
 
 /// Returns total PDI size in bytes.
 #[no_mangle]
 pub extern "C" fn ethercrab_get_pdi_total_size() -> u32 {
-    let guard = STATE.read();
-    if let Some(state) = guard.as_ref() {
-        state.pdi_size as u32
-    } else {
-        0
-    }
+    with_ffi_guard(0, || {
+        let guard = STATE.read();
+        if let Some(state) = guard.as_ref() {
+            state.pdi_size as u32
+        } else {
+            0
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn ethercrab_cyclic_tx_rx() -> c_int {
-    let guard = STATE.read();
-    let state = match guard.as_ref() {
-        Some(s) => s,
-        None => return -1,
-    };
+    with_ffi_guard(-1, || {
+        let guard = STATE.read();
+        let state = match guard.as_ref() {
+            Some(s) => s,
+            None => return -1,
+        };
 
-    // Fast path check
-    let group = match &state.group {
-        Some(GroupState::Op(g)) => g,
-        _ => return -2,
-    };
+        // Fast path check
+        let group = match &state.group {
+            Some(GroupState::Op(g)) => g,
+            _ => return -2,
+        };
 
-    let maindevice = &state.maindevice;
+        let maindevice = &state.maindevice;
 
-    // Sync Shared Memory -> EtherCrab SubDevice (before tx_rx)
-    // Copy outputs from shared buffer to slaves so writes to pdi_buffer[0..output_size] are sent
-    {
-        let buffer = state.pdi_buffer.read(); // Read lock
-        let mut offset = 0; // Outputs start at 0
-        for slave in group.iter(maindevice) {
-            let mut outs = slave.outputs_raw_mut();
-            if outs.is_empty() { continue; }
-            let len = outs.len();
-            if offset + len <= buffer.len() {
-                outs.copy_from_slice(&buffer[offset..offset+len]);
-                offset += len;
+        // Sync Shared Memory -> EtherCrab SubDevice (before tx_rx)
+        // Copy outputs from shared buffer to slaves so writes to pdi_buffer[0..output_size] are sent
+        {
+            let buffer = state.pdi_buffer.read(); // Read lock
+            let mut offset = 0; // Outputs start at 0
+            for slave in group.iter(maindevice) {
+                let mut outs = slave.outputs_raw_mut();
+                if outs.is_empty() { continue; }
+                let len = outs.len();
+                if offset + len <= buffer.len() {
+                    outs.copy_from_slice(&buffer[offset..offset+len]);
+                    offset += len;
+                }
             }
         }
-    }
 
-    // Perform IO (Blocking call on this thread)
-    // We rely on ethercrab's internal PDU timeout configuration.
-    // Lock contention from background tasks is handled by pausing them via NETWORK_HEALTHY flag.
-    let wkc = match smol::block_on(group.tx_rx(maindevice)) {
-        Ok(res) => {
-            NETWORK_HEALTHY.store(true, Ordering::Relaxed);
-            res.working_counter
-        },
-        Err(e) => {
-            NETWORK_HEALTHY.store(false, Ordering::Relaxed);
-            set_error(format!("Cyclic tx_rx failed: {:?}", e));
-            return -2;
-        },
-    };
-    // Copy Inputs (EtherCAT Frame -> Shared Memory)
-    {
-        let mut buffer = state.pdi_buffer.write();
-        let mut offset = state.output_size;
-        for slave in group.iter(maindevice) {
-            let ins = slave.inputs_raw();
-            if ins.is_empty() { continue; }
-            let len = ins.len();
-            if offset + len <= buffer.len() {
-                buffer[offset..offset+len].copy_from_slice(&ins);
-                offset += len;
+        // Perform IO (Blocking call on this thread)
+        // We rely on ethercrab's internal PDU timeout configuration.
+        // Lock contention from background tasks is handled by pausing them via NETWORK_HEALTHY flag.
+        let wkc = match smol::block_on(group.tx_rx(maindevice)) {
+            Ok(res) => {
+                NETWORK_HEALTHY.store(true, Ordering::Relaxed);
+                res.working_counter
+            },
+            Err(e) => {
+                NETWORK_HEALTHY.store(false, Ordering::Relaxed);
+                set_error(format!("Cyclic tx_rx failed: {:?}", e));
+                return -2;
+            },
+        };
+        // Copy Inputs (EtherCAT Frame -> Shared Memory)
+        {
+            let mut buffer = state.pdi_buffer.write();
+            let mut offset = state.output_size;
+            for slave in group.iter(maindevice) {
+                let ins = slave.inputs_raw();
+                if ins.is_empty() { continue; }
+                let len = ins.len();
+                if offset + len <= buffer.len() {
+                    buffer[offset..offset+len].copy_from_slice(&ins);
+                    offset += len;
+                }
             }
         }
-    }
 
-    // Note: WKC can vary depending on network topology and frame structure
-    // Strict checking disabled - return actual WKC and let application decide
-    wkc as c_int
+        // Note: WKC can vary depending on network topology and frame structure
+        // Strict checking disabled - return actual WKC and let application decide
+        wkc as c_int
+    })
 }
 
 #[no_mangle]
@@ -756,61 +937,63 @@ pub extern "C" fn ethercrab_sdo_read(
     data_out: *mut u8,
     max_len: usize,
 ) -> c_int {
-    if data_out.is_null() || max_len == 0 { return -4; }
+    with_ffi_guard(-1, || {
+        if data_out.is_null() || max_len == 0 { return -4; }
 
-    let guard = STATE.read();
-    let state = match guard.as_ref() {
-        Some(s) => s,
-        None => return -1,
-    };
+        let guard = STATE.read();
+        let state = match guard.as_ref() {
+            Some(s) => s,
+            None => return -1,
+        };
 
-    // We can only support small SDOs efficiently in this synchronous blocking manner
-    if max_len > 4 { return -4; }
+        // We can only support small SDOs efficiently in this synchronous blocking manner
+        if max_len > 4 { return -4; }
 
-    let result = smol::block_on(async {
-        let idx = slave_index as usize;
-        
-        // Generic helper to read
-        async fn read_sdo(
-            group: &GroupState, 
-            md: &MainDevice<'_>, 
-            idx: usize, 
-            i: u16, 
-            si: u8
-        ) -> Result<[u8; 4], i32> {
-            match group {
-                GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_read(i, si).await.map_err(|e| {
-                    set_error(format!("SDO read failed: {:?}", e));
-                    -3
-                }),
-                GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_read(i, si).await.map_err(|e| {
-                     set_error(format!("SDO read failed: {:?}", e));
-                    -3
-                }),
-                GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_read(i, si).await.map_err(|e| {
-                     set_error(format!("SDO read failed: {:?}", e));
-                    -3
-                }),
+        let result = smol::block_on(async {
+            let idx = slave_index as usize;
+            
+            // Generic helper to read
+            async fn read_sdo(
+                group: &GroupState, 
+                md: &MainDevice<'_>, 
+                idx: usize, 
+                i: u16, 
+                si: u8
+            ) -> Result<[u8; 4], i32> {
+                match group {
+                    GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_read(i, si).await.map_err(|e| {
+                        set_error(format!("SDO read failed: {:?}", e));
+                        -3
+                    }),
+                    GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_read(i, si).await.map_err(|e| {
+                         set_error(format!("SDO read failed: {:?}", e));
+                        -3
+                    }),
+                    GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_read(i, si).await.map_err(|e| {
+                         set_error(format!("SDO read failed: {:?}", e));
+                        -3
+                    }),
+                }
             }
-        }
 
-        match state.group.as_ref() {
-            Some(group) => read_sdo(group, &state.maindevice, idx, index, sub_index).await,
-            None => {
-                set_error("No group available for SDO read");
-                Err(-2)
+            match state.group.as_ref() {
+                Some(group) => read_sdo(group, &state.maindevice, idx, index, sub_index).await,
+                None => {
+                    set_error("No group available for SDO read");
+                    Err(-2)
+                }
             }
-        }
-    });
+        });
 
-    match result {
-        Ok(data) => {
-            let len = max_len.min(4);
-            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), data_out, len); }
-            len as c_int
-        },
-        Err(e) => e,
-    }
+        match result {
+            Ok(data) => {
+                let len = max_len.min(4);
+                unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), data_out, len); }
+                len as c_int
+            },
+            Err(e) => e,
+        }
+    })
 }
 
 #[no_mangle]
@@ -821,58 +1004,60 @@ pub extern "C" fn ethercrab_sdo_write(
     data: *const u8,
     len: usize,
 ) -> c_int {
-    if data.is_null() || len == 0 || len > 4 { return -4; }
-    
-    let mut data_buf = [0u8; 4];
-    unsafe { std::ptr::copy_nonoverlapping(data, data_buf.as_mut_ptr(), len); }
-
-    let guard = STATE.read();
-    let state = match guard.as_ref() {
-        Some(s) => s,
-        None => return -1,
-    };
-
-    let result = smol::block_on(async {
-        let idx = slave_index as usize;
-        let md = &state.maindevice;
-        let g = match state.group.as_ref() {
-            Some(g) => g,
-            None => {
-                set_error("No group available for SDO write");
-                return Err(-2);
-            }
-        };
+    with_ffi_guard(-1, || {
+        if data.is_null() || len == 0 || len > 4 { return -4; }
         
-        match len {
-            1 => match g {
-                GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, data_buf[0]).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-                GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, data_buf[0]).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-                GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, data_buf[0]).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-            },
-            2 => {
-                let val = u16::from_le_bytes([data_buf[0], data_buf[1]]);
-                match g {
-                    GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-                    GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-                    GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-                }
-            },
-            4 => {
-                let val = u32_from_bytes(data_buf);
-                match g {
-                    GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-                    GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-                    GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-                }
-            },
-            _ => return Err(-4)
-        }
-    });
+        let mut data_buf = [0u8; 4];
+        unsafe { std::ptr::copy_nonoverlapping(data, data_buf.as_mut_ptr(), len); }
 
-    match result {
-        Ok(_) => 0,
-        Err(e) => e,
-    }
+        let guard = STATE.read();
+        let state = match guard.as_ref() {
+            Some(s) => s,
+            None => return -1,
+        };
+
+        let result = smol::block_on(async {
+            let idx = slave_index as usize;
+            let md = &state.maindevice;
+            let g = match state.group.as_ref() {
+                Some(g) => g,
+                None => {
+                    set_error("No group available for SDO write");
+                    return Err(-2);
+                }
+            };
+            
+            match len {
+                1 => match g {
+                    GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, data_buf[0]).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
+                    GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, data_buf[0]).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
+                    GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, data_buf[0]).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
+                },
+                2 => {
+                    let val = u16::from_le_bytes([data_buf[0], data_buf[1]]);
+                    match g {
+                        GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
+                        GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
+                        GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
+                    }
+                },
+                4 => {
+                    let val = u32_from_bytes(data_buf);
+                    match g {
+                        GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
+                        GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
+                        GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
+                    }
+                },
+                _ => return Err(-4)
+            }
+        });
+
+        match result {
+            Ok(_) => 0,
+            Err(e) => e,
+        }
+    })
 }
 
 #[no_mangle]
@@ -882,106 +1067,112 @@ pub extern "C" fn ethercrab_eeprom_read(
     data_out: *mut u8,
     len: usize,
 ) -> c_int {
-    if data_out.is_null() || len == 0 { return -4; }
+    with_ffi_guard(-1, || {
+        if data_out.is_null() || len == 0 { return -4; }
 
-    let guard = STATE.read();
-    let state = match guard.as_ref() {
-        Some(s) => s,
-        None => return -1,
-    };
+        let guard = STATE.read();
+        let state = match guard.as_ref() {
+            Some(s) => s,
+            None => return -1,
+        };
 
-    let result = smol::block_on(async {
-        let idx = slave_index as usize;
-        let md = &state.maindevice;
-        let mut buffer = vec![0u8; len];
-        
-        let group = match state.group.as_ref() {
-            Some(g) => g,
-            None => {
-                set_error("No group available for EEPROM read");
-                return Err(-2);
+        let result = smol::block_on(async {
+            let idx = slave_index as usize;
+            let md = &state.maindevice;
+            let mut buffer = vec![0u8; len];
+            
+            let group = match state.group.as_ref() {
+                Some(g) => g,
+                None => {
+                    set_error("No group available for EEPROM read");
+                    return Err(-2);
+                }
+            };
+            
+            let read_res = match group {
+                GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.eeprom_read_raw(md, address, &mut buffer).await,
+                GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.eeprom_read_raw(md, address, &mut buffer).await,
+                GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.eeprom_read_raw(md, address, &mut buffer).await,
+            };
+
+            match read_res {
+                 Ok(bytes) => Ok((bytes, buffer)),
+                 Err(e) => {
+                     set_error(format!("EEPROM read failed: {:?}", e));
+                     Err(-3)
+                 }
             }
-        };
-        
-        let read_res = match group {
-            GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.eeprom_read_raw(md, address, &mut buffer).await,
-            GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.eeprom_read_raw(md, address, &mut buffer).await,
-            GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.eeprom_read_raw(md, address, &mut buffer).await,
-        };
+        });
 
-        match read_res {
-             Ok(bytes) => Ok((bytes, buffer)),
-             Err(e) => {
-                 set_error(format!("EEPROM read failed: {:?}", e));
-                 Err(-3)
-             }
+        match result {
+            Ok((bytes_read, buffer)) => {
+                unsafe { std::ptr::copy_nonoverlapping(buffer.as_ptr(), data_out, bytes_read as usize); }
+                bytes_read as c_int
+            },
+            Err(e) => e,
         }
-    });
-
-    match result {
-        Ok((bytes_read, buffer)) => {
-            unsafe { std::ptr::copy_nonoverlapping(buffer.as_ptr(), data_out, bytes_read as usize); }
-            bytes_read as c_int
-        },
-        Err(e) => e,
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn ethercrab_configure_mailbox_polling(interval_ms: u32) -> c_int {
-    let mut guard = STATE.write();
-    if let Some(state) = guard.as_mut() {
-        if interval_ms == 0 {
-            state.mailbox_poll_interval_ms = None;
+    with_ffi_guard(-1, || {
+        let mut guard = STATE.write();
+        if let Some(state) = guard.as_mut() {
+            if interval_ms == 0 {
+                state.mailbox_poll_interval_ms = None;
+            } else {
+                state.mailbox_poll_interval_ms = Some(interval_ms);
+            }
+            0
         } else {
-            state.mailbox_poll_interval_ms = Some(interval_ms);
+            -1
         }
-        0
-    } else {
-        -1
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn ethercrab_check_mailbox(slave_index: u16, mailbox_status_addr: u16) -> c_int {
-    // If network is unhealthy, skip IO to avoid lock contention
-    if !NETWORK_HEALTHY.load(Ordering::Relaxed) {
-        return -1;
-    }
-
-    // We don't need manual timeouts here as PDU timeouts are handled by ethercrab
-
-    let result = smol::block_on(async move {
-        let guard = STATE.read();
-        if let Some(ref master_state) = *guard {
-                let maindevice = &master_state.maindevice;
-                let idx = slave_index as usize;
-                
-                // Check we have a group
-                let group = match master_state.group.as_ref() {
-                    Some(g) => g,
-                    None => return Err(-1),
-                };
-                
-                let val_res = match group {
-                    GroupState::PreOp(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
-                    GroupState::SafeOp(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
-                    GroupState::Op(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
-                };
-                
-                match val_res {
-                    Ok(val) => Ok(if (val & 0x08) != 0 { 1 } else { 0 }),
-                    Err(_) => Err(-2)
-                }
-        } else {
-            Err(-1)
+    with_ffi_guard(-1, || {
+        // If network is unhealthy, skip IO to avoid lock contention
+        if !NETWORK_HEALTHY.load(Ordering::Relaxed) {
+            return -1;
         }
-    });
 
-    match result {
-        Ok(v) => v,
-        Err(e) => e,
-    }
+        // We don't need manual timeouts here as PDU timeouts are handled by ethercrab
+
+        let result = smol::block_on(async move {
+            let guard = STATE.read();
+            if let Some(ref master_state) = *guard {
+                    let maindevice = &master_state.maindevice;
+                    let idx = slave_index as usize;
+                    
+                    // Check we have a group
+                    let group = match master_state.group.as_ref() {
+                        Some(g) => g,
+                        None => return Err(-1),
+                    };
+                    
+                    let val_res = match group {
+                        GroupState::PreOp(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
+                        GroupState::SafeOp(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
+                        GroupState::Op(g) => g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await,
+                    };
+                    
+                    match val_res {
+                        Ok(val) => Ok(if (val & 0x08) != 0 { 1 } else { 0 }),
+                        Err(_) => Err(-2)
+                    }
+            } else {
+                Err(-1)
+            }
+        });
+
+        match result {
+            Ok(v) => v,
+            Err(e) => e,
+        }
+    })
 }
 
 /// Feature 402: Mailbox Resilient Layer
@@ -993,96 +1184,100 @@ pub extern "C" fn ethercrab_check_mailbox_resilient(
     mailbox_status_addr: u16,
     last_toggle_bit: u8, // 0 or 1. If > 1, ignore toggle check (first run)
 ) -> c_int {
-    // If network is unhealthy, skip IO to avoid lock contention
-    if !NETWORK_HEALTHY.load(Ordering::Relaxed) {
-        return -1;
-    }
+    with_ffi_guard(-1, || {
+        // If network is unhealthy, skip IO to avoid lock contention
+        if !NETWORK_HEALTHY.load(Ordering::Relaxed) {
+            return -1;
+        }
 
-    // Timeout is handled internally by ethercrab
+        // Timeout is handled internally by ethercrab
 
-    let result = smol::block_on(async move {
-        let guard = STATE.read();
-        if let Some(ref master_state) = *guard {
-            let maindevice = &master_state.maindevice;
-            let idx = slave_index as usize;
+        let result = smol::block_on(async move {
+            let guard = STATE.read();
+            if let Some(ref master_state) = *guard {
+                let maindevice = &master_state.maindevice;
+                let idx = slave_index as usize;
 
-            // Check we have a group
-            let group = match master_state.group.as_ref() {
-                Some(g) => g,
-                None => return Err(-1),
-            };
-
-            // Retry Loop (Resilient Layer) - max 3 attempts
-            for _attempt in 0..3 {
-                // 1. Read Register
-                let val_res = match group {
-                    GroupState::PreOp(g) => {
-                        g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await
-                    }
-                    GroupState::SafeOp(g) => {
-                        g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await
-                    }
-                    GroupState::Op(g) => {
-                        g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await
-                    }
+                // Check we have a group
+                let group = match master_state.group.as_ref() {
+                    Some(g) => g,
+                    None => return Err(-1),
                 };
 
-                match val_res {
-                    Ok(val) => {
-                        // Bit 3 = Mailbox Full (Input) (0x08)
-                        // Bit 1 = Toggle Bit (Input) (0x02)
-                        // Note: Check ETG.1000.4 spec for specific bit offsets per device
-
-                        let mailbox_full = (val & 0x08) != 0;
-                        let current_toggle = (val & 0x02) >> 1;
-
-                        if !mailbox_full {
-                            return Ok(0); // Empty
+                // Retry Loop (Resilient Layer) - max 3 attempts
+                for _attempt in 0..3 {
+                    // 1. Read Register
+                    let val_res = match group {
+                        GroupState::PreOp(g) => {
+                            g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await
                         }
-
-                        // If it's the first run (last_toggle_bit > 1), accept it.
-                        // If toggle bit changed, accept it.
-                        if last_toggle_bit > 1 || current_toggle != last_toggle_bit {
-                            return Ok(1); // Success: New valid mail
+                        GroupState::SafeOp(g) => {
+                            g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await
                         }
+                        GroupState::Op(g) => {
+                            g.iter(maindevice).nth(idx).ok_or(-1)?.register_read::<u8>(mailbox_status_addr).await
+                        }
+                    };
 
-                        // If we are here, Mailbox is full but Toggle Bit didn't change.
-                        // This implies we might be re-reading an old frame or a lost update.
-                        // Retry immediately.
-                        continue;
+                    match val_res {
+                        Ok(val) => {
+                            // Bit 3 = Mailbox Full (Input) (0x08)
+                            // Bit 1 = Toggle Bit (Input) (0x02)
+                            // Note: Check ETG.1000.4 spec for specific bit offsets per device
+
+                            let mailbox_full = (val & 0x08) != 0;
+                            let current_toggle = (val & 0x02) >> 1;
+
+                            if !mailbox_full {
+                                return Ok(0); // Empty
+                            }
+
+                            // If it's the first run (last_toggle_bit > 1), accept it.
+                            // If toggle bit changed, accept it.
+                            if last_toggle_bit > 1 || current_toggle != last_toggle_bit {
+                                return Ok(1); // Success: New valid mail
+                            }
+
+                            // If we are here, Mailbox is full but Toggle Bit didn't change.
+                            // This implies we might be re-reading an old frame or a lost update.
+                            // Retry immediately.
+                            continue;
+                        }
+                        Err(_) => continue, // Read failed, retry
                     }
-                    Err(_) => continue, // Read failed, retry
                 }
+
+                // Retries exhausted
+                Err(-2)
+            } else {
+                Err(-1)
             }
+        });
 
-            // Retries exhausted
-            Err(-2)
-        } else {
-            Err(-1)
+        match result {
+            Ok(v) => v,
+            Err(e) => e,
         }
-    });
-
-    match result {
-        Ok(v) => v,
-        Err(e) => e,
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn ethercrab_get_last_emergency(out: *mut EmergencyInfo) -> c_int {
-    if out.is_null() { return -1; }
+    with_ffi_guard(-1, || {
+        if out.is_null() { return -1; }
 
-    let guard = LAST_EMERGENCY.lock();
-    if let Some(ref emergency) = *guard {
-        unsafe {
-            (*out).slave_index = emergency.slave_index;
-            (*out).error_code = emergency.error_code;
-            (*out).error_register = emergency.error_register;
+        let guard = LAST_EMERGENCY.lock();
+        if let Some(ref emergency) = *guard {
+            unsafe {
+                (*out).slave_index = emergency.slave_index;
+                (*out).error_code = emergency.error_code;
+                (*out).error_register = emergency.error_register;
+            }
+            0
+        } else {
+            -1
         }
-        0
-    } else {
-        -1
-    }
+    })
 }
 
 #[no_mangle]
@@ -1091,30 +1286,32 @@ pub extern "C" fn ethercrab_write_process_data_byte(
     byte_offset: u32,
     value: u8,
 ) -> c_int {
-    let result = smol::block_on(async {
-        let mut guard = STATE.write();
-        let state = match guard.as_mut() {
-            Some(s) => s,
-            None => return 0,
-        };
+    with_ffi_guard(0, || {
+        let result = smol::block_on(async {
+            let mut guard = STATE.write();
+            let state = match guard.as_mut() {
+                Some(s) => s,
+                None => return 0,
+            };
 
-        let group = match &mut state.group {
-            Some(GroupState::Op(g)) => g,
-            _ => return 0, // Not in OP state
-        };
+            let group = match &mut state.group {
+                Some(GroupState::Op(g)) => g,
+                _ => return 0, // Not in OP state
+            };
 
-        let idx = slave_index as usize;
-        if let Some(subdevice) = group.iter(&state.maindevice).nth(idx) {
-            let mut outputs = subdevice.outputs_raw_mut();
-            if let Some(byte) = outputs.get_mut(byte_offset as usize) {
-                *byte = value;
-                return 1;
+            let idx = slave_index as usize;
+            if let Some(subdevice) = group.iter(&state.maindevice).nth(idx) {
+                let mut outputs = subdevice.outputs_raw_mut();
+                if let Some(byte) = outputs.get_mut(byte_offset as usize) {
+                    *byte = value;
+                    return 1;
+                }
             }
-        }
-        0
-    });
+            0
+        });
 
-    result
+        result
+    })
 }
 
 #[no_mangle]
@@ -1123,35 +1320,37 @@ pub extern "C" fn ethercrab_read_process_data_byte(
     byte_offset: u32,
     is_output: bool,
 ) -> u8 {
-    let result = smol::block_on(async {
-        let guard = STATE.read();
-        let state = match guard.as_ref() {
-            Some(s) => s,
-            None => return 0,
-        };
+    with_ffi_guard(0, || {
+        let result = smol::block_on(async {
+            let guard = STATE.read();
+            let state = match guard.as_ref() {
+                Some(s) => s,
+                None => return 0,
+            };
 
-        let group = match &state.group {
-            Some(GroupState::Op(g)) => g,
-            _ => return 0, // Not in OP state
-        };
+            let group = match &state.group {
+                Some(GroupState::Op(g)) => g,
+                _ => return 0, // Not in OP state
+            };
 
-        let idx = slave_index as usize;
-        if let Some(subdevice) = group.iter(&state.maindevice).nth(idx) {
-            let io = subdevice.io_raw();
-            if is_output {
-                if let Some(&byte) = io.outputs().get(byte_offset as usize) {
-                    return byte;
-                }
-            } else {
-                if let Some(&byte) = io.inputs().get(byte_offset as usize) {
-                    return byte;
+            let idx = slave_index as usize;
+            if let Some(subdevice) = group.iter(&state.maindevice).nth(idx) {
+                let io = subdevice.io_raw();
+                if is_output {
+                    if let Some(&byte) = io.outputs().get(byte_offset as usize) {
+                        return byte;
+                    }
+                } else {
+                    if let Some(&byte) = io.inputs().get(byte_offset as usize) {
+                        return byte;
+                    }
                 }
             }
-        }
-        0
-    });
+            0
+        });
 
-    result
+        result
+    })
 }
 
 /// Read a 16-bit register value from a slave.
@@ -1166,36 +1365,38 @@ pub extern "C" fn ethercrab_register_read_u16(
     slave_index: u16,
     register_address: u16,
 ) -> i32 {
-    let result = smol::block_on(async move {
-        let guard = STATE.read();
-        let state = match guard.as_ref() {
-            Some(s) => s,
-            None => return Err(-1),
-        };
+    with_ffi_guard(-1, || {
+        let result = smol::block_on(async move {
+            let guard = STATE.read();
+            let state = match guard.as_ref() {
+                Some(s) => s,
+                None => return Err(-1),
+            };
 
-        let idx = slave_index as usize;
-        let md = &state.maindevice;
-        
-        let val_res = match state.group.as_ref() {
-            Some(GroupState::PreOp(g)) => g.iter(md).nth(idx).ok_or(-2)?.register_read::<u16>(register_address).await,
-            Some(GroupState::SafeOp(g)) => g.iter(md).nth(idx).ok_or(-2)?.register_read::<u16>(register_address).await,
-            Some(GroupState::Op(g)) => g.iter(md).nth(idx).ok_or(-2)?.register_read::<u16>(register_address).await,
-            None => return Err(-1),
-        };
-        
-        match val_res {
-            Ok(val) => Ok(val as i32),
-            Err(e) => {
-                set_error(format!("Register read failed: {:?}", e));
-                Err(-3)
+            let idx = slave_index as usize;
+            let md = &state.maindevice;
+            
+            let val_res = match state.group.as_ref() {
+                Some(GroupState::PreOp(g)) => g.iter(md).nth(idx).ok_or(-2)?.register_read::<u16>(register_address).await,
+                Some(GroupState::SafeOp(g)) => g.iter(md).nth(idx).ok_or(-2)?.register_read::<u16>(register_address).await,
+                Some(GroupState::Op(g)) => g.iter(md).nth(idx).ok_or(-2)?.register_read::<u16>(register_address).await,
+                None => return Err(-1),
+            };
+            
+            match val_res {
+                Ok(val) => Ok(val as i32),
+                Err(e) => {
+                    set_error(format!("Register read failed: {:?}", e));
+                    Err(-3)
+                }
             }
-        }
-    });
+        });
 
-    match result {
-        Ok(v) => v,
-        Err(e) => e,
-    }
+        match result {
+            Ok(v) => v,
+            Err(e) => e,
+        }
+    })
 }
 
 /// Write a 16-bit register value to a slave.
@@ -1210,43 +1411,70 @@ pub extern "C" fn ethercrab_register_write_u16(
     register_address: u16,
     value: u16,
 ) -> i32 {
-    let result = smol::block_on(async move {
-        let guard = STATE.read();
-        let state = match guard.as_ref() {
-            Some(s) => s,
-            None => return Err(-1),
-        };
+    with_ffi_guard(-1, || {
+        let result = smol::block_on(async move {
+            let guard = STATE.read();
+            let state = match guard.as_ref() {
+                Some(s) => s,
+                None => return Err(-1),
+            };
 
-        let idx = slave_index as usize;
-        let md = &state.maindevice;
-        
-        let write_res = match state.group.as_ref() {
-            Some(GroupState::PreOp(g)) => g.iter(md).nth(idx).ok_or(-2)?.register_write(register_address, value).await,
-            Some(GroupState::SafeOp(g)) => g.iter(md).nth(idx).ok_or(-2)?.register_write(register_address, value).await,
-            Some(GroupState::Op(g)) => g.iter(md).nth(idx).ok_or(-2)?.register_write(register_address, value).await,
-            None => return Err(-1),
-        };
-        
-        match write_res {
-            Ok(_) => Ok(0),
-            Err(e) => {
-                set_error(format!("Register write failed: {:?}", e));
-                Err(-3)
+            let idx = slave_index as usize;
+            let md = &state.maindevice;
+            
+            let write_res = match state.group.as_ref() {
+                Some(GroupState::PreOp(g)) => g.iter(md).nth(idx).ok_or(-2)?.register_write(register_address, value).await,
+                Some(GroupState::SafeOp(g)) => g.iter(md).nth(idx).ok_or(-2)?.register_write(register_address, value).await,
+                Some(GroupState::Op(g)) => g.iter(md).nth(idx).ok_or(-2)?.register_write(register_address, value).await,
+                None => return Err(-1),
+            };
+            
+            match write_res {
+                Ok(_) => Ok(0),
+                Err(e) => {
+                    set_error(format!("Register write failed: {:?}", e));
+                    Err(-3)
+                }
             }
-        }
-    });
+        });
 
-    match result {
-        Ok(v) => v,
-        Err(e) => e,
-    }
+        match result {
+            Ok(v) => v,
+            Err(e) => e,
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn ethercrab_destroy() {
-    *STATE.write() = None;
-    *GLOBAL_DEVICE.write() = None;
-    *LAST_EMERGENCY.lock() = None;
+    with_ffi_guard((), || {
+        // 1. Clear GLOBAL_DEVICE to prevent new tasks using it
+        *GLOBAL_DEVICE.write() = None;
+        
+        // 2. Take STATE to own the resources
+        let mut guard = STATE.write();
+        if let Some(mut state) = guard.take() {
+            // 3. Signal shutdown
+            state.shutdown_signal.store(true, Ordering::Relaxed);
+            
+            // 4. Drop MainDevice and Group (closes PduLoop channels)
+            drop(state.group); 
+            drop(state.maindevice);
+            
+            // 5. Join Thread
+            if let Some(handle) = state.tx_rx_thread.take() {
+                let _ = handle.join();
+            }
+
+            // 6. Free storage
+            if state.storage_ptr != 0 {
+                unsafe {
+                    let _ = Box::from_raw(state.storage_ptr as *mut PduStorage<MAX_FRAMES, MAX_PDU_DATA>);
+                }
+            }
+        }
+        *LAST_EMERGENCY.lock() = None;
+    })
 }
 // --- Discovery FFI ---
 
@@ -1539,153 +1767,166 @@ async fn perform_scan(maindevice: &MainDevice<'_>) -> Result<Vec<DiscoveredSlave
 
 #[no_mangle]
 pub extern "C" fn ethercrab_scan_new(interface: *const c_char) -> *mut ScanContext {
-    if interface.is_null() { return std::ptr::null_mut(); }
+    with_ffi_guard(std::ptr::null_mut(), || {
+        if interface.is_null() { return std::ptr::null_mut(); }
 
-    // Check global state lock to avoid hardware resource conflict
-    if STATE.read().is_some() {
-        return std::ptr::null_mut();
-    }
-
-    let interface_str = unsafe {
-        match CStr::from_ptr(interface).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return std::ptr::null_mut(),
+        // Check global state lock to avoid hardware resource conflict
+        if STATE.read().is_some() {
+            return std::ptr::null_mut();
         }
-    };
 
-    // We use a separate PDU storage for scanning to avoid conflict with global STATE
-    // MAX_FRAMES=16, MAX_PDU_DATA=1100 -> ~17KB. Safe for stack or heap.
-    
-    let result: Result<*mut ScanContext, i32> = smol::block_on(async move {
-        #[cfg(not(target_os = "windows"))]
-        {
-            // On macOS/Linux we can use future::race to clean up the task.
-            // Storage is stack allocated (Boxed) and dropped after race.
-            let storage = Box::new(PduStorage::<16, 1100>::new());
-            let (tx, rx, pdu_loop) = storage.try_split().map_err(|_| {
-                set_error("Scan storage split failed");
-                -1
-            })?;
-            
-            let maindevice = MainDevice::new(
-                pdu_loop,
-                Timeouts::default(),
-                MainDeviceConfig {
-                    dc_static_sync_iterations: 0,  // Disable DC
-                    ..MainDeviceConfig::default()
-                },
-            );
-            
-            let iface = interface_str.clone();
-            
-            // Task 1: Network Loop
-            let network_fut = async {
-                match ethercrab::std::tx_rx_task(&iface, tx, rx) {
-                    Ok(task) => {
-                        if let Err(e) = task.await {
-                            set_error(&format!("Scan network task failed: {}", e));
+        let interface_str = unsafe {
+            match CStr::from_ptr(interface).to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => return std::ptr::null_mut(),
+            }
+        };
+
+        // We use a separate PDU storage for scanning to avoid conflict with global STATE
+        // MAX_FRAMES=16, MAX_PDU_DATA=1100 -> ~17KB. Safe for stack or heap.
+        
+        let result: Result<*mut ScanContext, i32> = smol::block_on(async move {
+            #[cfg(not(target_os = "windows"))]
+            {
+                // On macOS/Linux we can use future::race to clean up the task.
+                // Storage is stack allocated (Boxed) and dropped after race.
+                let storage = Box::new(PduStorage::<16, 1100>::new());
+                let (tx, rx, pdu_loop) = storage.try_split().map_err(|_| {
+                    set_error("Scan storage split failed");
+                    -1
+                })?;
+                
+                let maindevice = MainDevice::new(
+                    pdu_loop,
+                    Timeouts::default(),
+                    MainDeviceConfig {
+                        dc_static_sync_iterations: 0,  // Disable DC
+                        ..MainDeviceConfig::default()
+                    },
+                );
+                
+                let iface = interface_str.clone();
+                
+                // Task 1: Network Loop
+                let network_fut = async {
+                    match ethercrab::std::tx_rx_task(&iface, tx, rx) {
+                        Ok(task) => {
+                            if let Err(e) = task.await {
+                                set_error(&format!("Scan network task failed: {}", e));
+                                return Err(-1);
+                            }
+                        },
+                        Err(e) => {
+                            set_error(&format!("Scan TX/RX failed: {}", e));
+                            return Err(-1);
+                        }
+                    }
+                    // Should not return unless error or cancelled
+                    set_error("Scan network task ended unexpectedly");
+                    Err(-1) 
+                };
+
+                // Task 2: Scan Logic
+                let scan_fut = async {
+                    let slaves = perform_scan(&maindevice).await?;
+                    Ok(Box::into_raw(Box::new(ScanContext { slaves })))
+                };
+                
+                // Race them. When scan_fut completes, network_fut is dropped.
+                future::race(scan_fut, network_fut).await
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                // On Windows, we stick to the leak model for now due to threading constraints
+                // (tx_rx_task_blocking requires blocking thread)
+                let storage = Box::leak(Box::new(PduStorage::<16, 1100>::new()));
+                let (tx, rx, pdu_loop) = storage.try_split().map_err(|_| {
+                    set_error("Scan storage split failed");
+                    -1
+                })?;
+                
+                let maindevice = MainDevice::new(
+                    pdu_loop,
+                    Timeouts::default(),
+                    MainDeviceConfig {
+                        dc_static_sync_iterations: 0,  // Disable DC
+                        ..MainDeviceConfig::default()
+                    },
+                );
+                
+                let iface = interface_str.clone();
+
+                // Proactively check if the interface exists to prevent panic in tx_rx_task_blocking
+                match pcap::Capture::from_device(iface.as_str()) {
+                    Ok(builder) => {
+                        if let Err(e) = builder.open() {
+                            set_error(format!("Failed to open interface '{}', try using NPF IDs. {}", iface, e));
                             return Err(-1);
                         }
                     },
                     Err(e) => {
-                        set_error(&format!("Scan TX/RX failed: {}", e));
-                        return Err(-1);
+                            set_error(format!("Invalid interface '{}', try using NPF IDs. {}", iface, e));
+                            return Err(-1);
                     }
                 }
-                // Should not return unless error or cancelled
-                set_error("Scan network task ended unexpectedly");
-                Err(-1) 
-            };
 
-            // Task 2: Scan Logic
-            let scan_fut = async {
+                 std::thread::spawn(move || {
+                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                         let _ = ethercrab::std::tx_rx_task_blocking(&iface, tx, rx, ethercrab::std::TxRxTaskConfig { spinloop: false });
+                     }));
+                     if let Err(panic) = result {
+                         set_error(format!("Scan TX/RX thread panicked: {}", panic_message(panic)));
+                     }
+                 });
+
                 let slaves = perform_scan(&maindevice).await?;
                 Ok(Box::into_raw(Box::new(ScanContext { slaves })))
-            };
-            
-            // Race them. When scan_fut completes, network_fut is dropped.
-            future::race(scan_fut, network_fut).await
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            // On Windows, we stick to the leak model for now due to threading constraints
-            // (tx_rx_task_blocking requires blocking thread)
-            let storage = Box::leak(Box::new(PduStorage::<16, 1100>::new()));
-            let (tx, rx, pdu_loop) = storage.try_split().map_err(|_| {
-                set_error("Scan storage split failed");
-                -1
-            })?;
-            
-            let maindevice = MainDevice::new(
-                pdu_loop,
-                Timeouts::default(),
-                MainDeviceConfig {
-                    dc_static_sync_iterations: 0,  // Disable DC
-                    ..MainDeviceConfig::default()
-                },
-            );
-            
-            let iface = interface_str.clone();
-
-            // Proactively check if the interface exists to prevent panic in tx_rx_task_blocking
-            match pcap::Capture::from_device(iface.as_str()) {
-                Ok(builder) => {
-                    if let Err(e) = builder.open() {
-                        set_error(format!("Failed to open interface '{}', try using NPF IDs. {}", iface, e));
-                        return Err(-1);
-                    }
-                },
-                Err(e) => {
-                        set_error(format!("Invalid interface '{}', try using NPF IDs. {}", iface, e));
-                        return Err(-1);
-                }
             }
+        });
 
-             std::thread::spawn(move || {
-                 let _ = ethercrab::std::tx_rx_task_blocking(&iface, tx, rx, ethercrab::std::TxRxTaskConfig { spinloop: false });
-             });
-
-            let slaves = perform_scan(&maindevice).await?;
-            Ok(Box::into_raw(Box::new(ScanContext { slaves })))
+        match result {
+            Ok(ptr) => ptr,
+            Err(_) => std::ptr::null_mut(),
         }
-    });
-
-    match result {
-        Ok(ptr) => ptr,
-        Err(_) => std::ptr::null_mut(),
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn ethercrab_scan_get_slave_count(ctx: *const ScanContext) -> u32 {
-    if ctx.is_null() { return 0; }
-    unsafe { (*ctx).slaves.len() as u32 }
+    with_ffi_guard(0, || {
+        if ctx.is_null() { return 0; }
+        unsafe { (*ctx).slaves.len() as u32 }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn ethercrab_scan_get_slave(ctx: *const ScanContext, idx: u32, out_info: *mut FfiSlaveInfo) -> c_int {
-    if ctx.is_null() || out_info.is_null() { return -1; }
-    unsafe {
-        if let Some(slave) = (&(*ctx).slaves).get(idx as usize) {
-            *out_info = slave.info;
-            0
-        } else {
-            -1
+    with_ffi_guard(-1, || {
+        if ctx.is_null() || out_info.is_null() { return -1; }
+        unsafe {
+            if let Some(slave) = (&(*ctx).slaves).get(idx as usize) {
+                *out_info = slave.info;
+                0
+            } else {
+                -1
+            }
         }
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn ethercrab_scan_get_pdo_count(ctx: *const ScanContext, slave_idx: u32) -> u32 {
-    if ctx.is_null() { return 0; }
-    unsafe {
-        if let Some(slave) = (&(*ctx).slaves).get(slave_idx as usize) {
-            slave.pdos.len() as u32
-        } else {
-            0
+    with_ffi_guard(0, || {
+        if ctx.is_null() { return 0; }
+        unsafe {
+            if let Some(slave) = (&(*ctx).slaves).get(slave_idx as usize) {
+                slave.pdos.len() as u32
+            } else {
+                0
+            }
         }
-    }
+    })
 }
 
 #[no_mangle]
@@ -1695,19 +1936,21 @@ pub extern "C" fn ethercrab_scan_get_pdo(
     pdo_pos: u32, 
     out_info: *mut FfiPdoInfo
 ) -> c_int {
-    if ctx.is_null() || out_info.is_null() { return -1; }
-    unsafe {
-        if let Some(slave) = (&(*ctx).slaves).get(slave_idx as usize) {
-            if let Some(pdo) = slave.pdos.get(pdo_pos as usize) {
-                *out_info = pdo.info;
-                0
+    with_ffi_guard(-1, || {
+        if ctx.is_null() || out_info.is_null() { return -1; }
+        unsafe {
+            if let Some(slave) = (&(*ctx).slaves).get(slave_idx as usize) {
+                if let Some(pdo) = slave.pdos.get(pdo_pos as usize) {
+                    *out_info = pdo.info;
+                    0
+                } else {
+                    -1
+                }
             } else {
                 -1
             }
-        } else {
-            -1
         }
-    }
+    })
 }
 
 #[no_mangle]
@@ -1716,15 +1959,17 @@ pub extern "C" fn ethercrab_scan_get_pdo_entry_count(
     slave_idx: u32, 
     pdo_pos: u32
 ) -> u32 {
-    if ctx.is_null() { return 0; }
-    unsafe {
-        if let Some(slave) = (&(*ctx).slaves).get(slave_idx as usize) {
-            if let Some(pdo) = slave.pdos.get(pdo_pos as usize) {
-                return pdo.entries.len() as u32;
+    with_ffi_guard(0, || {
+        if ctx.is_null() { return 0; }
+        unsafe {
+            if let Some(slave) = (&(*ctx).slaves).get(slave_idx as usize) {
+                if let Some(pdo) = slave.pdos.get(pdo_pos as usize) {
+                    return pdo.entries.len() as u32;
+                }
             }
+            0
         }
-        0
-    }
+    })
 }
 
 #[no_mangle]
@@ -1735,30 +1980,34 @@ pub extern "C" fn ethercrab_scan_get_pdo_entry(
     entry_pos: u32, 
     out_info: *mut FfiPdoEntryInfo
 ) -> c_int {
-    if ctx.is_null() || out_info.is_null() { return -1; }
-    unsafe {
-        if let Some(slave) = (&(*ctx).slaves).get(slave_idx as usize) {
-            if let Some(pdo) = slave.pdos.get(pdo_pos as usize) {
-                if let Some(entry) = pdo.entries.get(entry_pos as usize) {
-                    *out_info = entry.info;
-                    0
+    with_ffi_guard(-1, || {
+        if ctx.is_null() || out_info.is_null() { return -1; }
+        unsafe {
+            if let Some(slave) = (&(*ctx).slaves).get(slave_idx as usize) {
+                if let Some(pdo) = slave.pdos.get(pdo_pos as usize) {
+                    if let Some(entry) = pdo.entries.get(entry_pos as usize) {
+                        *out_info = entry.info;
+                        0
+                    } else {
+                        -1
+                    }
                 } else {
                     -1
                 }
             } else {
                 -1
             }
-        } else {
-            -1
         }
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn ethercrab_scan_free(ctx: *mut ScanContext) {
-    if !ctx.is_null() {
-        unsafe {
-            let _ = Box::from_raw(ctx);
+    with_ffi_guard((), || {
+        if !ctx.is_null() {
+            unsafe {
+                let _ = Box::from_raw(ctx);
+            }
         }
-    }
+    })
 }
