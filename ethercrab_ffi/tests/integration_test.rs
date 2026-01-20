@@ -19,6 +19,7 @@ use ethercrab_ffi::{
     ethercrab_get_state,
     ethercrab_get_pdi_buffer_ptr,
     ethercrab_get_pdi_total_size,
+    ethercrab_get_last_error,
     ethercrab_init,
     ethercrab_request_state,
     ethercrab_cyclic_tx_rx,
@@ -58,6 +59,17 @@ fn get_test_interface() -> Option<CString> {
         .and_then(|s| CString::new(s).ok())
 }
 
+/// Helper to get the last error message
+fn get_last_error() -> String {
+    let mut buf = [0u8; 512];
+    let len = ethercrab_get_last_error(buf.as_mut_ptr(), buf.len());
+    if len > 0 {
+        String::from_utf8_lossy(&buf[..len as usize]).to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// Setup hardware connection - returns true if successful
 /// Note: Due to static PDU storage, init can only succeed once per process.
 /// Subsequent calls will reuse the existing connection if already in PreOp or higher.
@@ -85,6 +97,10 @@ fn setup_hardware() -> bool {
         100,   // eeprom_timeout_ms
         3,     // pdu_retries
     );
+    
+    if result != 0 {
+        eprintln!("ethercrab_init returned {}, error: {}", result, get_last_error());
+    }
     
     result == 0
 }

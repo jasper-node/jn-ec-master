@@ -38,17 +38,7 @@ struct EcMasterState {
     output_size: usize,
     expected_wkc: u16,
     mailbox_poll_interval_ms: Option<u32>,
-    // Resources for cleanup
-    tx_rx_thread: Option<JoinHandle<()>>,
-    storage_ptr: usize,
-    shutdown_signal: Arc<AtomicBool>,
 }
-
-// SAFETY: EcMasterState is only accessed through RwLock<Option<...>> 
-// which provides synchronization. The storage_ptr is only used during
-// init (single-threaded) and destroy (after thread join).
-unsafe impl Send for EcMasterState {}
-unsafe impl Sync for EcMasterState {}
 
 #[derive(Clone, Copy)]
 struct InternalEmergencyInfo {
@@ -60,9 +50,18 @@ struct InternalEmergencyInfo {
 // --- Global State ---
 static STATE: Lazy<RwLock<Option<EcMasterState>>> = Lazy::new(|| RwLock::new(None));
 static GLOBAL_DEVICE: Lazy<RwLock<Option<Arc<MainDevice<'static>>>>> = Lazy::new(|| RwLock::new(None));
+// Track TX/RX thread resources globally so they can be cleaned up even if STATE is never set
+static TX_RX_RESOURCES: Lazy<Mutex<Option<TxRxResources>>> = Lazy::new(|| Mutex::new(None));
 static LAST_ERROR: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 static LAST_EMERGENCY: Lazy<Mutex<Option<InternalEmergencyInfo>>> = Lazy::new(|| Mutex::new(None));
 static NETWORK_HEALTHY: AtomicBool = AtomicBool::new(true);
+
+// Resources for TX/RX thread cleanup (stored globally for cleanup even on partial init failure)
+struct TxRxResources {
+    thread_handle: Option<JoinHandle<()>>,
+    shutdown_signal: Arc<AtomicBool>,
+    storage_ptr: usize,
+}
 
 fn set_error(err: impl std::fmt::Display) {
     let mut guard = LAST_ERROR.lock();
@@ -317,10 +316,11 @@ pub extern "C" fn ethercrab_init(
             NETWORK_HEALTHY.store(true, Ordering::Relaxed);
 
             #[cfg(target_os = "windows")]
-            let (maindevice, storage_ptr, shutdown_signal, thread_handle) = {
+            let maindevice = {
                 let guard = GLOBAL_DEVICE.read();
                 if let Some(md) = guard.as_ref() {
-                    (md.clone(), 0usize, Arc::new(AtomicBool::new(false)), None)
+                    // Reuse existing maindevice - TX_RX_RESOURCES already has the thread info
+                    md.clone()
                 } else {
                     drop(guard); // Release read lock before acquiring write lock
 
@@ -328,7 +328,7 @@ pub extern "C" fn ethercrab_init(
                     let mut guard = GLOBAL_DEVICE.write();
                     // Check if someone else initialized while we were waiting
                     if let Some(md) = guard.as_ref() {
-                        (md.clone(), 0usize, Arc::new(AtomicBool::new(false)), None)
+                        md.clone()
                     } else {
                         // Create storage on heap and convert to raw pointer to manage lifetime manually
                         let storage_box = Box::new(PduStorage::<MAX_FRAMES, MAX_PDU_DATA>::new());
@@ -431,18 +431,29 @@ pub extern "C" fn ethercrab_init(
                                 -3
                             })?;
 
+                        // Store TX/RX resources globally for cleanup
+                        *TX_RX_RESOURCES.lock() = Some(TxRxResources {
+                            thread_handle: Some(handle),
+                            shutdown_signal: shutdown,
+                            storage_ptr: storage_ptr_val,
+                        });
+
                         *guard = Some(maindevice.clone());
                         
-                        (maindevice, storage_ptr_val, shutdown, Some(handle))
+                        // Give the TX/RX thread time to start up and open the interface
+                        std::thread::sleep(Duration::from_millis(100));
+                        
+                        maindevice
                     }
                 }
             };
 
             #[cfg(not(target_os = "windows"))]
-            let (maindevice, storage_ptr, shutdown_signal, thread_handle) = {
+            let maindevice = {
                 let guard = GLOBAL_DEVICE.read();
                 if let Some(md) = guard.as_ref() {
-                    (md.clone(), 0usize, Arc::new(AtomicBool::new(false)), None)
+                    // Reuse existing maindevice - TX_RX_RESOURCES already has the thread info
+                    md.clone()
                 } else {
                     drop(guard); // Release read lock before acquiring write lock
 
@@ -450,7 +461,7 @@ pub extern "C" fn ethercrab_init(
                     let mut guard = GLOBAL_DEVICE.write();
                     // Check if someone else initialized while we were waiting
                     if let Some(md) = guard.as_ref() {
-                        (md.clone(), 0usize, Arc::new(AtomicBool::new(false)), None)
+                        md.clone()
                     } else {
                         // Create storage on heap and convert to raw pointer to manage lifetime manually
                         let storage_box = Box::new(PduStorage::<MAX_FRAMES, MAX_PDU_DATA>::new());
@@ -518,9 +529,19 @@ pub extern "C" fn ethercrab_init(
                                 -3
                             })?;
 
+                        // Store TX/RX resources globally for cleanup
+                        *TX_RX_RESOURCES.lock() = Some(TxRxResources {
+                            thread_handle: Some(handle),
+                            shutdown_signal: shutdown,
+                            storage_ptr: storage_ptr_val,
+                        });
+
                         *guard = Some(maindevice.clone());
                         
-                        (maindevice, storage_ptr_val, shutdown, Some(handle))
+                        // Give the TX/RX thread time to start up and open the interface
+                        std::thread::sleep(Duration::from_millis(100));
+                        
+                        maindevice
                     }
                 }
             };
@@ -557,9 +578,6 @@ pub extern "C" fn ethercrab_init(
                 output_size: 0,
                 expected_wkc: 0,
                 mailbox_poll_interval_ms: None,
-                tx_rx_thread: thread_handle,
-                storage_ptr,
-                shutdown_signal,
             };
 
             let mut guard = STATE.write();
@@ -1458,30 +1476,39 @@ pub extern "C" fn ethercrab_register_write_u16(
 #[no_mangle]
 pub extern "C" fn ethercrab_destroy() {
     with_ffi_guard((), || {
-        // 1. Clear GLOBAL_DEVICE to prevent new tasks using it
-        *GLOBAL_DEVICE.write() = None;
-        
-        // 2. Take STATE to own the resources
-        let mut guard = STATE.write();
-        if let Some(mut state) = guard.take() {
-            // 3. Signal shutdown
-            state.shutdown_signal.store(true, Ordering::Relaxed);
+        // 1. Take TX_RX_RESOURCES first and signal shutdown BEFORE clearing GLOBAL_DEVICE
+        // This ensures the thread sees the shutdown signal before we drop anything
+        let resources = TX_RX_RESOURCES.lock().take();
+        if let Some(mut res) = resources {
+            // Signal shutdown to the TX/RX thread
+            res.shutdown_signal.store(true, Ordering::Relaxed);
             
-            // 4. Drop MainDevice and Group (closes PduLoop channels)
-            drop(state.group); 
-            drop(state.maindevice);
+            // 2. Now clear GLOBAL_DEVICE (drops the MainDevice Arc)
+            *GLOBAL_DEVICE.write() = None;
             
-            // 5. Join Thread
-            if let Some(handle) = state.tx_rx_thread.take() {
+            // 3. Clear STATE (drops the group and maindevice clone)
+            let mut guard = STATE.write();
+            if let Some(state) = guard.take() {
+                drop(state.group);
+                drop(state.maindevice);
+            }
+            drop(guard);
+            
+            // 4. Join the TX/RX thread (now that shutdown is signaled and channels closed)
+            if let Some(handle) = res.thread_handle.take() {
                 let _ = handle.join();
             }
 
-            // 6. Free storage
-            if state.storage_ptr != 0 {
+            // 5. Free storage after thread has exited
+            if res.storage_ptr != 0 {
                 unsafe {
-                    let _ = Box::from_raw(state.storage_ptr as *mut PduStorage<MAX_FRAMES, MAX_PDU_DATA>);
+                    let _ = Box::from_raw(res.storage_ptr as *mut PduStorage<MAX_FRAMES, MAX_PDU_DATA>);
                 }
             }
+        } else {
+            // No TX_RX_RESOURCES, but still clear STATE and GLOBAL_DEVICE
+            *GLOBAL_DEVICE.write() = None;
+            *STATE.write() = None;
         }
         *LAST_EMERGENCY.lock() = None;
     })
