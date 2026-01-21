@@ -88,7 +88,7 @@ export class EcMaster extends EventEmitter {
 
   private isClosing = false;
   private isClosed = false;
-  static REQUIRED_FFI_VERSION = "0.1.6";
+  static REQUIRED_FFI_VERSION = "0.1.7";
 
   // Static tracking to prevent creating new instances before previous one is properly closed
   private static activeInstance: EcMaster | null = null;
