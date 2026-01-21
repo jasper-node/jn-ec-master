@@ -44,7 +44,7 @@ Deno.test("startEmergencyPolling - calls stopEmergencyPolling first", async () =
 
   // Clean up
   master.stopEmergencyPolling();
-  master.close();
+  await master.close();
 });
 
 Deno.test("startEmergencyPolling - returns early when no CoE slaves exist", async () => {
@@ -72,7 +72,7 @@ Deno.test("startEmergencyPolling - returns early when no CoE slaves exist", asyn
   assertEquals(master.emergencyPollingInterval, undefined);
 
   // Clean up
-  master.close();
+  await master.close();
 });
 
 Deno.test("startEmergencyPolling - sets up interval when CoE slaves exist", async () => {
@@ -101,7 +101,7 @@ Deno.test("startEmergencyPolling - sets up interval when CoE slaves exist", asyn
 
   // Clean up
   master.stopEmergencyPolling();
-  master.close();
+  await master.close();
 });
 
 Deno.test("startEmergencyPolling - clears existing interval before starting new one", async () => {
@@ -133,7 +133,7 @@ Deno.test("startEmergencyPolling - clears existing interval before starting new 
 
   // Clean up
   master.stopEmergencyPolling();
-  master.close();
+  await master.close();
 });
 
 Deno.test("startEmergencyPolling - emits emergency event for CoE-enabled slave", async () => {
@@ -179,7 +179,7 @@ Deno.test("startEmergencyPolling - emits emergency event for CoE-enabled slave",
 
   // Clean up
   master.stopEmergencyPolling();
-  master.close();
+  await master.close();
 });
 
 Deno.test("startEmergencyPolling - does NOT emit emergency event for non-CoE slave", async () => {
@@ -224,7 +224,7 @@ Deno.test("startEmergencyPolling - does NOT emit emergency event for non-CoE sla
 
   // Clean up
   master.stopEmergencyPolling();
-  master.close();
+  await master.close();
 });
 
 Deno.test("startEmergencyPolling - does NOT emit duplicate emergency events", async () => {
@@ -266,7 +266,7 @@ Deno.test("startEmergencyPolling - does NOT emit duplicate emergency events", as
 
   // Clean up
   master.stopEmergencyPolling();
-  master.close();
+  await master.close();
 });
 
 Deno.test("startEmergencyPolling - emits new emergency from same CoE slave when error changes", async () => {
@@ -322,7 +322,7 @@ Deno.test("startEmergencyPolling - emits new emergency from same CoE slave when 
 
   // Clean up
   master.stopEmergencyPolling();
-  master.close();
+  await master.close();
 });
 
 Deno.test("startEmergencyPolling - handles multiple CoE slaves correctly", async () => {
@@ -381,7 +381,7 @@ Deno.test("startEmergencyPolling - handles multiple CoE slaves correctly", async
 
   // Clean up
   master.stopEmergencyPolling();
-  master.close();
+  await master.close();
 });
 
 // --- Mocks & Stubs ---
@@ -681,7 +681,7 @@ Deno.test("Ride-Through: Successful cycle resets missedCycleCount", async () => 
       "Critical Network Failure",
     );
   } finally {
-    master.close();
+    await master.close();
     dlopenStub.restore();
     statStub.restore();
   }
@@ -732,7 +732,7 @@ Deno.test("Ride-Through: Mixed timeout and WKC errors accumulate", async () => {
       "Critical Network Failure",
     );
   } finally {
-    master.close();
+    await master.close();
     dlopenStub.restore();
     statStub.restore();
   }
@@ -749,7 +749,7 @@ Deno.test("Ride-Through: Other fatal errors throw immediately", async () => {
       "Cyclic task failed",
     );
   } finally {
-    master.close();
+    await master.close();
     dlopenStub.restore();
     statStub.restore();
   }
@@ -770,7 +770,7 @@ Deno.test("Ride-Through: missedCycleCount is accessible for diagnostics", async 
     await master.runCycle();
     assertEquals(masterAny.missedCycleCount, 2, "Count should be 2 after second timeout");
   } finally {
-    master.close();
+    await master.close();
     dlopenStub.restore();
     statStub.restore();
   }
