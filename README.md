@@ -268,6 +268,8 @@ deno task test:rust
 
 # Specifying am interface (using env var)
 IF=eth0 deno task test:hardware
+# on Linux
+sudo -E env "PATH=$PATH" RUST_MIN_STACK=8388608 ETHERCAT_INTERFACE=eth0 cargo test --test integration_test -- --test-threads=1
 ```
 
 _Note: Tests use `serial_test` to run sequentially as they share a global

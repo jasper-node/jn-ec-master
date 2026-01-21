@@ -21,6 +21,7 @@ use ethercrab_ffi::{
     ethercrab_get_pdi_total_size,
     ethercrab_get_last_error,
     ethercrab_init,
+    ethercrab_destroy,
     ethercrab_request_state,
     ethercrab_cyclic_tx_rx,
     ethercrab_sdo_read,
@@ -71,8 +72,8 @@ fn get_last_error() -> String {
 }
 
 /// Setup hardware connection - returns true if successful
-/// Note: Due to static PDU storage, init can only succeed once per process.
-/// Subsequent calls will reuse the existing connection if already in PreOp or higher.
+/// Note: This now properly cleans up any previous state before initializing,
+/// matching the pattern used by the TypeScript wrapper.
 fn setup_hardware() -> bool {
     // Check if already initialized (state > 0 means we have a connection)
     let current_state = ethercrab_get_state();
@@ -84,6 +85,14 @@ fn setup_hardware() -> bool {
         Some(i) => i,
         None => return false,
     };
+    
+    // IMPORTANT: Clean up any previous partial initialization
+    // This matches the TypeScript pattern in discoverNetwork() which calls
+    // ethercrab_destroy() before ethercrab_scan_new() or ethercrab_init()
+    ethercrab_destroy();
+    
+    // Small delay to allow cleanup to complete
+    std::thread::sleep(std::time::Duration::from_millis(100));
     
     let result = ethercrab_init(
         interface.as_ptr(),
@@ -105,11 +114,11 @@ fn setup_hardware() -> bool {
     result == 0
 }
 
-/// Teardown hardware - resets state but keeps connection alive for reuse
-/// Note: Full destroy would prevent subsequent tests from working due to static PDU storage
+/// Teardown hardware - properly cleans up the connection
 fn teardown_hardware() {
-    // Don't destroy - just allow reuse by next test
-    // The connection will be cleaned up when the test process exits
+    // Properly destroy the connection so subsequent tests start fresh
+    ethercrab_destroy();
+    // Small delay to allow cleanup to complete
     std::thread::sleep(std::time::Duration::from_millis(50));
 }
 
@@ -473,21 +482,18 @@ fn test_scan_network() {
         return;
     }
     
-    // First verify we can initialize (proves hardware is accessible)
-    if !setup_hardware() {
-        println!("Skipping scan test - hardware init failed (check interface and permissions)");
-        return;
-    }
-    teardown_hardware();
-    
-    // Now try the scan
     let interface = get_test_interface().expect("Interface required");
     
-    // Perform network scan (may panic if interface not accessible - that's a test failure)
+    // IMPORTANT: Clean up any previous state before scanning
+    // The scan API uses separate resources but checks if STATE is locked
+    ethercrab_destroy();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    
+    // Perform network scan
     let ctx = ethercrab_scan_new(interface.as_ptr());
     if ctx.is_null() {
-        println!("Scan returned null - interface may not support raw sockets");
-        return;
+        let error = get_last_error();
+        panic!("Scan returned null - error: {} (check interface name and permissions)", error);
     }
     
     // Get slave count
@@ -507,22 +513,20 @@ fn test_scan_get_slave_info() {
         return;
     }
     
-    // First verify we can initialize (proves hardware is accessible)
-    if !setup_hardware() {
-        println!("Skipping scan test - hardware init failed (check interface and permissions)");
-        return;
-    }
-    teardown_hardware();
-    
     let interface = get_test_interface().expect("Interface required");
+    
+    // IMPORTANT: Clean up any previous state before scanning
+    ethercrab_destroy();
+    std::thread::sleep(std::time::Duration::from_millis(100));
     
     let ctx = ethercrab_scan_new(interface.as_ptr());
     if ctx.is_null() {
-        println!("Scan returned null - interface may not support raw sockets");
-        return;
+        let error = get_last_error();
+        panic!("Scan returned null - error: {} (check interface name and permissions)", error);
     }
     
     let slave_count = ethercrab_scan_get_slave_count(ctx);
+    assert!(slave_count > 0, "Expected at least one slave for this test");
     
     // Get info for each discovered slave
     for i in 0..slave_count {
