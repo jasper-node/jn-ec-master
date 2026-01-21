@@ -472,7 +472,7 @@ Deno.test("Mailbox Resilience: Initialization State", async () => {
       ],
     });
   } finally {
-    master.close();
+    await master.close();
     dlopenStub.restore();
     statStub.restore();
     // Restore the spy on the mock object
@@ -518,7 +518,7 @@ Deno.test("Mailbox Resilience: Successful Toggle Flip", async () => {
     // Master logic: (1 === 0) ? 1 : 0 => New Toggle is 0.
     assertSpyCall(checkStub, 2, { args: [0, 0x080D, 1] });
   } finally {
-    master.close();
+    await master.close();
     dlopenStub.restore();
     statStub.restore();
     checkStub.restore();
@@ -546,7 +546,7 @@ Deno.test("Mailbox Resilience: Retry Failure Handling", async () => {
 
     assertEquals(errorEmitted, true, "Should emit mailboxError when Rust returns -2");
   } finally {
-    master.close();
+    await master.close();
     dlopenStub.restore();
     statStub.restore();
     checkStub.restore();
@@ -603,7 +603,7 @@ Deno.test("Ride-Through: Single PDU timeout returns -2 without throwing", async 
     const wkc = await master.runCycle();
     assertEquals(wkc, -2);
   } finally {
-    master.close();
+    await master.close();
     dlopenStub.restore();
     statStub.restore();
   }
@@ -624,7 +624,7 @@ Deno.test("Ride-Through: 4 consecutive PDU timeouts do not throw", async () => {
     }
     assertEquals(callCount, 4);
   } finally {
-    master.close();
+    await master.close();
     dlopenStub.restore();
     statStub.restore();
   }
@@ -646,7 +646,7 @@ Deno.test("Ride-Through: 5 consecutive PDU timeouts throw FfiError", async () =>
       "Critical Network Failure: 5 consecutive timeouts",
     );
   } finally {
-    master.close();
+    await master.close();
     dlopenStub.restore();
     statStub.restore();
   }
@@ -704,7 +704,7 @@ Deno.test("Ride-Through: WKC mismatch (-4) uses ride-through logic", async () =>
       "WKC mismatch",
     );
   } finally {
-    master.close();
+    await master.close();
     dlopenStub.restore();
     statStub.restore();
   }

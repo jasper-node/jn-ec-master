@@ -40,6 +40,7 @@ export const ethercrabSymbols = {
   ethercrab_destroy: {
     parameters: [],
     result: "void",
+    nonblocking: true, // Async: Waits for TX/RX thread to join (up to ~50-100ms)
   },
 
   // State & Topology

@@ -91,6 +91,86 @@ where
     }
 }
 
+// --- Windows TX/RX Helpers ---
+
+/// Validates that a network interface can be opened on Windows.
+/// Returns Ok(()) if the interface is valid, Err with error code otherwise.
+#[cfg(target_os = "windows")]
+fn validate_windows_interface(iface: &str) -> Result<(), i32> {
+    match pcap::Capture::from_device(iface) {
+        Ok(builder) => {
+            if let Err(e) = builder.open() {
+                set_error(format!("Failed to open interface '{}': {}", iface, e));
+                return Err(-2);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            set_error(format!("Invalid interface '{}': {}", iface, e));
+            Err(-2)
+        }
+    }
+}
+
+/// Macro for the Windows TX/RX loop body.
+/// This is a macro because tx/rx have different generic parameters in different contexts,
+/// and macros avoid the lifetime/ownership issues that would arise with a generic function.
+#[cfg(target_os = "windows")]
+macro_rules! windows_tx_rx_loop {
+    ($iface:expr, $tx:expr, $rx:expr, $shutdown:expr) => {{
+        // Open pcap capture
+        let mut cap = match pcap::Capture::from_device($iface)
+            .and_then(|b| b.immediate_mode(true).open())
+            .and_then(|c| c.setnonblock())
+        {
+            Ok(c) => c,
+            Err(e) => {
+                set_error(format!("Failed to open capture on '{}': {}", $iface, e));
+                return;
+            }
+        };
+
+        let mut sq = match pcap::sendqueue::SendQueue::new(1024 * 1024) {
+            Ok(q) => q,
+            Err(e) => {
+                set_error(format!("Failed to create send queue: {}", e));
+                return;
+            }
+        };
+
+        while !$shutdown.load(Ordering::SeqCst) {
+            // TX: Send pending frames
+            let mut sent = 0;
+            while let Some(frame) = $tx.next_sendable_frame() {
+                let _ = frame.send_blocking(|bytes| {
+                    sq.queue(None, bytes).expect("Enqueue");
+                    Ok(bytes.len())
+                });
+                sent += 1;
+            }
+
+            if sent > 0 {
+                let _ = sq.transmit(&mut cap, pcap::sendqueue::SendSync::Off);
+            }
+
+            // RX: Poll for packets (non-blocking, up to 16 per tick)
+            for _ in 0..16 {
+                match cap.next_packet() {
+                    Ok(packet) => {
+                        let _ = $rx.receive_frame(packet.data);
+                    }
+                    Err(pcap::Error::NoMorePackets) => break,
+                    Err(pcap::Error::TimeoutExpired) => break,
+                    Err(_) => break,
+                }
+            }
+
+            // Yield to prevent 100% CPU usage
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }};
+}
+
 // --- FFI Structs ---
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -356,69 +436,15 @@ pub extern "C" fn ethercrab_init(
                         let shutdown = Arc::new(AtomicBool::new(false));
                         let shutdown_clone = shutdown.clone();
 
-                        // Proactively check if the interface exists to prevent panic in tx_rx_task_blocking
-                        // We must try to OPEN it, not just create the capture builder.
-                        match pcap::Capture::from_device(iface.as_str()) {
-                            Ok(builder) => {
-                                if let Err(e) = builder.open() {
-                                    set_error(format!("Failed to open interface '{}': {}", iface, e));
-                                    return Err(-2);
-                                }
-                            },
-                            Err(e) => {
-                                 set_error(format!("Invalid interface '{}': {}", iface, e));
-                                 return Err(-2);
-                            }
-                        }
+                        // Validate interface before spawning thread
+                        validate_windows_interface(&iface)?;
 
                         let handle = std::thread::Builder::new()
                             .name("ethercrab-tx-rx".into())
                             .stack_size(8 * 1024 * 1024)
                             .spawn(move || {
                                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    // Manual TX/RX loop with shutdown support
-                                    let mut cap = pcap::Capture::from_device(iface.as_str())
-                                        .expect("Device")
-                                        .immediate_mode(true)
-                                        .open()
-                                        .expect("Open device")
-                                        .setnonblock()
-                                        .expect("Can't set non-blocking");
-
-                                    let mut sq = pcap::sendqueue::SendQueue::new(1024 * 1024).expect("Failed to create send queue");
-
-                                    while !shutdown_clone.load(Ordering::Relaxed) {
-                                        let mut sent = 0;
-                                        while let Some(frame) = tx.next_sendable_frame() {
-                                            let _ = frame.send_blocking(|bytes| {
-                                                sq.queue(None, bytes).expect("Enqueue");
-                                                Ok(bytes.len())
-                                            });
-                                            sent += 1;
-                                        }
-
-                                        if sent > 0 {
-                                            let _ = sq.transmit(&mut cap, pcap::sendqueue::SendSync::Off);
-                                        }
-
-                                        // Poll for packets (non-blocking)
-                                        // Process up to 16 packets per tick to avoid starving TX
-                                        for _ in 0..16 {
-                                            match cap.next_packet() {
-                                                Ok(packet) => {
-                                                    if let Err(_) = rx.receive_frame(packet.data) {
-                                                        // Ignore errors (malformed/unrelated packets)
-                                                    }
-                                                }
-                                                Err(pcap::Error::NoMorePackets) => break,
-                                                Err(pcap::Error::TimeoutExpired) => break,
-                                                Err(_) => break, // Error or device lost
-                                            }
-                                        }
-                                        
-                                        // Sleep to prevent 100% CPU usage
-                                        std::thread::sleep(Duration::from_millis(1));
-                                    }
+                                    windows_tx_rx_loop!(iface.as_str(), tx, rx, shutdown_clone);
                                 }));
 
                                 if let Err(panic) = result {
@@ -502,7 +528,7 @@ pub extern "C" fn ethercrab_init(
                                                 task.await.map(|_| ())
                                             };
                                             let shutdown_fut = async {
-                                                while !shutdown_clone.load(Ordering::Relaxed) {
+                                                while !shutdown_clone.load(Ordering::SeqCst) {
                                                     smol::Timer::after(Duration::from_millis(50)).await;
                                                 }
                                                 Ok::<(), ethercrab::error::Error>(())
@@ -1476,30 +1502,32 @@ pub extern "C" fn ethercrab_register_write_u16(
 #[no_mangle]
 pub extern "C" fn ethercrab_destroy() {
     with_ffi_guard((), || {
-        // 1. Take TX_RX_RESOURCES first and signal shutdown BEFORE clearing GLOBAL_DEVICE
-        // This ensures the thread sees the shutdown signal before we drop anything
+        // 1. Take TX_RX_RESOURCES first
         let resources = TX_RX_RESOURCES.lock().take();
         if let Some(mut res) = resources {
-            // Signal shutdown to the TX/RX thread
-            res.shutdown_signal.store(true, Ordering::Relaxed);
+            // 2. Signal shutdown with SeqCst for full memory ordering guarantee
+            //    This ensures the TX/RX thread sees the signal before we proceed
+            res.shutdown_signal.store(true, Ordering::SeqCst);
             
-            // 2. Now clear GLOBAL_DEVICE (drops the MainDevice Arc)
+            // 3. JOIN THE THREAD FIRST - Wait for TX/RX thread to fully stop
+            //    BEFORE dropping any shared resources. This prevents use-after-free.
+            if let Some(handle) = res.thread_handle.take() {
+                let _ = handle.join();
+            }
+            
+            // 4. NOW clear GLOBAL_DEVICE (drops the MainDevice Arc)
+            //    Thread has stopped, so this is safe
             *GLOBAL_DEVICE.write() = None;
             
-            // 3. Clear STATE (drops the group and maindevice clone)
+            // 5. Clear STATE (drops the group and maindevice clone)
             let mut guard = STATE.write();
             if let Some(state) = guard.take() {
                 drop(state.group);
                 drop(state.maindevice);
             }
             drop(guard);
-            
-            // 4. Join the TX/RX thread (now that shutdown is signaled and channels closed)
-            if let Some(handle) = res.thread_handle.take() {
-                let _ = handle.join();
-            }
 
-            // 5. Free storage after thread has exited
+            // 6. Free storage LAST - after everything else is cleaned up
             if res.storage_ptr != 0 {
                 unsafe {
                     let _ = Box::from_raw(res.storage_ptr as *mut PduStorage<MAX_FRAMES, MAX_PDU_DATA>);
@@ -1875,11 +1903,15 @@ pub extern "C" fn ethercrab_scan_new(interface: *const c_char) -> *mut ScanConte
 
             #[cfg(target_os = "windows")]
             {
-                // On Windows, we stick to the leak model for now due to threading constraints
-                // (tx_rx_task_blocking requires blocking thread)
-                let storage = Box::leak(Box::new(PduStorage::<16, 1100>::new()));
-                let (tx, rx, pdu_loop) = storage.try_split().map_err(|_| {
+                // On Windows, we use a manual TX/RX loop with shutdown support (same as ethercrab_init)
+                let storage_box = Box::new(PduStorage::<16, 1100>::new());
+                let storage_ptr = Box::into_raw(storage_box);
+                let storage = unsafe { &mut *storage_ptr };
+                
+                let (mut tx, mut rx, pdu_loop) = storage.try_split().map_err(|_| {
                     set_error("Scan storage split failed");
+                    // Clean up storage on error
+                    unsafe { let _ = Box::from_raw(storage_ptr); }
                     -1
                 })?;
                 
@@ -1894,31 +1926,54 @@ pub extern "C" fn ethercrab_scan_new(interface: *const c_char) -> *mut ScanConte
                 
                 let iface = interface_str.clone();
 
-                // Proactively check if the interface exists to prevent panic in tx_rx_task_blocking
-                match pcap::Capture::from_device(iface.as_str()) {
-                    Ok(builder) => {
-                        if let Err(e) = builder.open() {
-                            set_error(format!("Failed to open interface '{}', try using NPF IDs. {}", iface, e));
-                            return Err(-1);
-                        }
-                    },
-                    Err(e) => {
-                            set_error(format!("Invalid interface '{}', try using NPF IDs. {}", iface, e));
-                            return Err(-1);
-                    }
+                // Validate interface before spawning thread (with scan-specific error and cleanup)
+                if let Err(_) = validate_windows_interface(&iface) {
+                    // Add NPF hint to error message for scan
+                    let existing_err = LAST_ERROR.lock().clone();
+                    set_error(format!("{} (Try using NPF IDs)", existing_err));
+                    unsafe { let _ = Box::from_raw(storage_ptr); }
+                    return Err(-1);
                 }
 
-                 std::thread::spawn(move || {
-                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                         let _ = ethercrab::std::tx_rx_task_blocking(&iface, tx, rx, ethercrab::std::TxRxTaskConfig { spinloop: false });
-                     }));
-                     if let Err(panic) = result {
-                         set_error(format!("Scan TX/RX thread panicked: {}", panic_message(panic)));
-                     }
-                 });
+                // Shutdown signal for the scan TX/RX thread
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let shutdown_clone = shutdown.clone();
 
-                let slaves = perform_scan(&maindevice).await?;
-                Ok(Box::into_raw(Box::new(ScanContext { slaves })))
+                let handle = std::thread::Builder::new()
+                    .name("ethercrab-scan-tx-rx".into())
+                    .spawn(move || {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            windows_tx_rx_loop!(iface.as_str(), tx, rx, shutdown_clone);
+                        }));
+
+                        if let Err(panic) = result {
+                            set_error(format!("Scan TX/RX thread panicked: {}", panic_message(panic)));
+                        }
+                    })
+                    .map_err(|e| {
+                        set_error(format!("Failed to spawn scan TX/RX thread: {}", e));
+                        unsafe { let _ = Box::from_raw(storage_ptr); }
+                        -1
+                    })?;
+
+                // Give the TX/RX thread time to start
+                std::thread::sleep(Duration::from_millis(50));
+
+                // Perform the scan
+                let scan_result = perform_scan(&maindevice).await;
+
+                // Signal shutdown and wait for thread to stop
+                shutdown.store(true, Ordering::SeqCst);
+                let _ = handle.join();
+
+                // Clean up storage after thread has stopped
+                unsafe { let _ = Box::from_raw(storage_ptr); }
+
+                // Return scan result
+                match scan_result {
+                    Ok(slaves) => Ok(Box::into_raw(Box::new(ScanContext { slaves }))),
+                    Err(e) => Err(e),
+                }
             }
         });
 

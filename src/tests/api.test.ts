@@ -105,7 +105,7 @@ Deno.test({
       const buffer = master.getProcessDataBuffer();
       assertEquals(buffer.byteLength, 20); // From mock return value [10, 10, 20, ptr]
 
-      master.close();
+      await master.close();
     } finally {
       teardownMocks();
     }
@@ -132,7 +132,7 @@ Deno.test({
       const buffer = master.getProcessDataBuffer();
       assertEquals(buffer.byteLength, 20, "Buffer should have correct size");
 
-      master.close();
+      await master.close();
     } finally {
       teardownMocks();
     }
@@ -159,7 +159,7 @@ Deno.test({
 
       assert(eventFired, "stateChange event should have fired");
 
-      master.close();
+      await master.close();
     } finally {
       teardownMocks();
     }
@@ -174,7 +174,7 @@ Deno.test({
       const master = new EcMaster(validConfig);
       // Should pass as mock returns 0
       await master.verifyTopology();
-      master.close();
+      await master.close();
     } finally {
       teardownMocks();
     }
@@ -189,7 +189,7 @@ Deno.test({
       const master = new EcMaster(validConfig);
       const result = await master.isRawSocketAvailable();
       assertEquals(result, true);
-      master.close();
+      await master.close();
     } finally {
       teardownMocks();
     }

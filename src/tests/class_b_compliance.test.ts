@@ -153,7 +153,7 @@ Deno.test({
       // by checking that the interval is set (indirectly through behavior)
       assert(true, "Mailbox polling should be configured during initialization");
     } finally {
-      if (master) master.close();
+      if (master) await master.close();
       teardownMocks();
     }
   },
@@ -195,7 +195,7 @@ Deno.test({
         "Should be called with default toggle (2) on first run",
       );
     } finally {
-      if (master) master.close();
+      if (master) await master.close();
       teardownMocks();
     }
   },
@@ -224,7 +224,7 @@ Deno.test({
       // Note: We can't directly test readMailbox() call without exposing it,
       // but we can verify the function was called with success result
     } finally {
-      if (master) master.close();
+      if (master) await master.close();
       teardownMocks();
     }
   },
@@ -258,7 +258,7 @@ Deno.test({
       assert(emergencyEmitted, "mailboxError event should be emitted on retry failure");
       assertEquals(emittedSlaveIndex, 0, "Event should include correct slave index");
     } finally {
-      if (master) master.close();
+      if (master) await master.close();
       teardownMocks();
     }
   },
@@ -281,7 +281,7 @@ Deno.test({
       // We can't directly access private fields, but we can verify behavior
       assert(true, "Emergency polling should be configured during initialization");
     } finally {
-      if (master) master.close();
+      if (master) await master.close();
       teardownMocks();
     }
   },
@@ -295,9 +295,10 @@ Deno.test({
         return 0; // No emergency
       },
     });
+    let master: EcMaster | null = null;
 
     try {
-      const master = new EcMaster(configWithoutCoe);
+      master = new EcMaster(configWithoutCoe);
       await master.initialize();
 
       // Wait a bit
@@ -309,6 +310,7 @@ Deno.test({
       // Note: This is indirect verification
       assert(true, "Emergency polling should not start for non-CoE slaves");
     } finally {
+      if (master) await master.close();
       teardownMocks();
     }
   },
@@ -367,7 +369,7 @@ Deno.test({
         "Event should have correct error register",
       );
     } finally {
-      if (master) master.close();
+      if (master) await master.close();
       teardownMocks();
     }
   },
@@ -413,7 +415,7 @@ Deno.test({
         "Emergency event should be emitted only once for duplicate emergencies",
       );
     } finally {
-      if (master) master.close();
+      if (master) await master.close();
       teardownMocks();
     }
   },
@@ -431,16 +433,16 @@ Deno.test({
       },
     });
 
+    let master: EcMaster | null = null;
     try {
-      const master = new EcMaster(configWithCoeSlave);
+      master = new EcMaster(configWithCoeSlave);
       await master.initialize();
 
       // Wait for one poll
       await new Promise((resolve) => setTimeout(resolve, 25));
       const countBeforeClose = callCount;
 
-      // Close should stop polling
-      master.close();
+      await master.close();
 
       // Wait again - should not poll
       await new Promise((resolve) => setTimeout(resolve, 25));
@@ -449,6 +451,7 @@ Deno.test({
       // Count should not increase after close
       assertEquals(countAfterClose, countBeforeClose, "Polling should stop after close()");
     } finally {
+      if (master) await master.close();
       teardownMocks();
     }
   },

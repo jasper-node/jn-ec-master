@@ -86,8 +86,12 @@ export class EcMaster extends EventEmitter {
   private emergencyPollingInterval?: number; // Timer ID
   private lastEmergencySlave: Map<number, EmergencyEvent> = new Map(); // Track per-slave
 
+  private isClosing = false;
   private isClosed = false;
   static REQUIRED_FFI_VERSION = "0.1.6";
+
+  // Static tracking to prevent creating new instances before previous one is properly closed
+  private static activeInstance: EcMaster | null = null;
 
   // FAULT TOLERANCE CONFIGURATION
   // 5 consecutive timeouts @ 20ms cycle = 100ms "Ride Through" duration
@@ -165,8 +169,19 @@ export class EcMaster extends EventEmitter {
   constructor(eniConfig: EniConfig, dirPath?: string) {
     super();
 
+    // Prevent creating new instance if previous one wasn't properly closed
+    if (EcMaster.activeInstance && !EcMaster.activeInstance.isClosed) {
+      throw new Error(
+        "Cannot create new EcMaster instance: previous instance was not properly closed. " +
+          "Call close() and await its completion before creating a new instance.",
+      );
+    }
+
     this.eniConfig = eniConfig;
     this.dl = EcMaster.openLibrary(dirPath || EcMaster.defaultDirPath);
+
+    // Track this as the active instance
+    EcMaster.activeInstance = this;
   }
 
   /**
@@ -1064,10 +1079,10 @@ export class EcMaster extends EventEmitter {
 
     // Start polling loop
     this.mailboxPollingInterval = setInterval(async () => {
-      if (this.isClosed) return;
+      if (this.isClosing) return;
 
       for (const { slave, index } of mailboxSlaves) {
-        if (this.isClosed) break;
+        if (this.isClosing) break;
 
         try {
           const statusAddr = slave.mailboxStatusAddr!;
@@ -1083,7 +1098,7 @@ export class EcMaster extends EventEmitter {
           );
 
           // Check again after await - library might have been closed during the call
-          if (this.isClosed) break;
+          if (this.isClosing) break;
 
           if (result === 1) {
             // Success: New mail detected
@@ -1110,7 +1125,7 @@ export class EcMaster extends EventEmitter {
             });
           }
         } catch (error) {
-          if (!this.isClosed) {
+          if (!this.isClosing) {
             console.warn(`Mailbox polling failed for slave ${index}:`, error);
           }
         }
@@ -1141,7 +1156,7 @@ export class EcMaster extends EventEmitter {
     if (coeSlaves.length === 0) return;
 
     this.emergencyPollingInterval = setInterval(() => {
-      if (this.isClosed) return;
+      if (this.isClosing) return;
 
       // Rust stores the *last* global emergency.
       // We poll it and check if it applies to one of our CoE slaves.
@@ -1280,7 +1295,7 @@ export class EcMaster extends EventEmitter {
   }
 
   getLastEmergency(): EmergencyEvent | null {
-    if (this.isClosed) return null;
+    if (this.isClosing) return null;
 
     try {
       const buffer = new Uint8Array(EMERGENCY_INFO_SIZE);
@@ -1297,22 +1312,30 @@ export class EcMaster extends EventEmitter {
       }
       return null;
     } catch {
-      // Suppress errors if library is closed
+      // Suppress errors if library is closing/closed
       return null;
     }
   }
 
   // Cleanup
-  close(): void {
-    if (this.isClosed) return;
-    this.isClosed = true;
+  async close(): Promise<void> {
+    if (this.isClosing || this.isClosed) return;
+    this.isClosing = true;
 
     this.stopMailboxPolling();
     this.stopEmergencyPolling();
+
     try {
-      this.dl.symbols.ethercrab_destroy();
+      // Await the native destroy - it joins the TX/RX thread (up to ~50-100ms)
+      await this.dl.symbols.ethercrab_destroy();
     } catch (_) {
       // ignore
+    } finally {
+      this.isClosed = true;
+      // Clear the static instance tracker so a new instance can be created
+      if (EcMaster.activeInstance === this) {
+        EcMaster.activeInstance = null;
+      }
     }
 
     this.dl.close();
