@@ -584,8 +584,13 @@ export class EcMaster extends EventEmitter {
 
     const result = await this.dl.symbols.ethercrab_request_state(targetState);
     if (result < 0) {
+      const { message, context } = this.getLastErrorStructured();
       throw new StateTransitionError(
-        `State transition failed with code ${result}: ${this.getLastError()}`,
+        `State transition to ${SlaveState[targetState]} failed: ${message}`,
+        undefined,
+        SlaveState[previousState],
+        SlaveState[targetState],
+        context,
       );
     }
 
@@ -778,9 +783,11 @@ export class EcMaster extends EventEmitter {
     );
 
     if (result < 0) {
+      const { message, context } = this.getLastErrorStructured();
       throw new FfiError(
-        `Initialization failed: ${this.getLastError()}`,
+        `Initialization failed: ${message}`,
         result,
+        context,
       );
     }
 
@@ -838,9 +845,12 @@ export class EcMaster extends EventEmitter {
 
         // Critical Threshold Reached?
         if (this.missedCycleCount >= EcMaster.MAX_MISSED_CYCLES) {
+          const { message, context } = this.getLastErrorStructured();
+          const cycleTimeUs = String(this.eniConfig.master.cycleTime ?? 10000);
           throw new FfiError(
-            `Critical Network Failure: ${this.missedCycleCount} consecutive timeouts. Connection lost.`,
+            `Critical Network Failure: ${this.missedCycleCount} consecutive timeouts. ${message}`,
             wkc,
+            { ...context, cycle_time_us: cycleTimeUs },
           );
         }
 
@@ -856,15 +866,20 @@ export class EcMaster extends EventEmitter {
 
         // Critical Threshold Reached?
         if (this.missedCycleCount >= EcMaster.MAX_MISSED_CYCLES) {
-          const errMsg = this.getLastError();
-          throw new PdoIntegrityError(`WKC mismatch: ${errMsg} (Code: ${wkc})`);
+          const { message } = this.getLastErrorStructured();
+          throw new PdoIntegrityError(`WKC mismatch: ${message} (Code: ${wkc})`);
         }
 
         return wkc;
       }
 
       // OTHER FATAL ERRORS (Driver failure, etc.)
-      throw new FfiError(`Cyclic task failed: ${this.getLastError()}`, wkc);
+      const { message, context } = this.getLastErrorStructured();
+      const cycleTimeUs = String(this.eniConfig.master.cycleTime ?? 10000);
+      throw new FfiError(`Cyclic task failed: ${message}`, wkc, {
+        ...context,
+        cycle_time_us: cycleTimeUs,
+      });
     }
 
     // 5. SUCCESS PATH
@@ -996,7 +1011,8 @@ export class EcMaster extends EventEmitter {
     );
 
     if (bytesRead < 0) {
-      throw new FfiError(`SDO read failed: ${this.getLastError()}`, bytesRead);
+      const { message, context } = this.getLastErrorStructured();
+      throw new FfiError(`SDO read failed: ${message}`, bytesRead, context);
     }
     return buffer.slice(0, bytesRead);
   }
@@ -1016,7 +1032,8 @@ export class EcMaster extends EventEmitter {
     );
 
     if (result < 0) {
-      throw new FfiError(`SDO write failed: ${this.getLastError()}`, result);
+      const { message, context } = this.getLastErrorStructured();
+      throw new FfiError(`SDO write failed: ${message}`, result, context);
     }
   }
 
@@ -1035,7 +1052,8 @@ export class EcMaster extends EventEmitter {
     );
 
     if (result < 0) {
-      throw new FfiError(`EEPROM read failed: ${this.getLastError()}`, result);
+      const { message, context } = this.getLastErrorStructured();
+      throw new FfiError(`EEPROM read failed: ${message}`, result, context);
     }
     return buffer.slice(0, result); // Result is bytes read
   }
@@ -1211,7 +1229,8 @@ export class EcMaster extends EventEmitter {
       registerAddress,
     );
     if (result < 0) {
-      throw new FfiError(`Register read failed: ${this.getLastError()}`, result);
+      const { message, context } = this.getLastErrorStructured();
+      throw new FfiError(`Register read failed: ${message}`, result, context);
     }
     return result;
   }
@@ -1235,7 +1254,8 @@ export class EcMaster extends EventEmitter {
       value,
     );
     if (result < 0) {
-      throw new FfiError(`Register write failed: ${this.getLastError()}`, result);
+      const { message, context } = this.getLastErrorStructured();
+      throw new FfiError(`Register write failed: ${message}`, result, context);
     }
   }
 
@@ -1344,7 +1364,7 @@ export class EcMaster extends EventEmitter {
   }
 
   private getLastError(): string {
-    const bufSize = 1024;
+    const bufSize = 2048;
     const buffer = new Uint8Array(bufSize);
     const len = this.dl.symbols.ethercrab_get_last_error(
       buffer,
@@ -1352,6 +1372,40 @@ export class EcMaster extends EventEmitter {
     );
     if (len <= 0) return "Unknown error (no message set)";
     return new TextDecoder().decode(buffer.subarray(0, len));
+  }
+
+  private getLastErrorStructured(): {
+    message: string;
+    context?: Record<string, string>;
+  } {
+    const raw = this.getLastError();
+    const delimIdx = raw.indexOf("||");
+    if (delimIdx === -1) {
+      return { message: raw };
+    }
+    const message = raw.substring(0, delimIdx);
+    try {
+      const context = JSON.parse(raw.substring(delimIdx + 2));
+      return { message, context };
+    } catch {
+      return { message: raw };
+    }
+  }
+
+  /**
+   * Returns true if the EtherCAT network is healthy (last cyclic exchange succeeded).
+   */
+  isNetworkHealthy(): boolean {
+    if (!this.dl) return false;
+    return this.dl.symbols.ethercrab_get_network_healthy() === 1;
+  }
+
+  /**
+   * Returns the total number of errors recorded in the error ring buffer.
+   */
+  getErrorCount(): bigint {
+    if (!this.dl) return 0n;
+    return this.dl.symbols.ethercrab_get_error_count() as bigint;
   }
 
   /**

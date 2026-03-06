@@ -202,6 +202,24 @@ export const ethercrabSymbols = {
     parameters: ["pointer"],
     result: "void",
   },
+
+  // Diagnostics
+  ethercrab_get_network_healthy: {
+    parameters: [],
+    result: "i32",
+  },
+  ethercrab_get_error_count: {
+    parameters: [],
+    result: "u64",
+  },
+  ethercrab_get_error_detail: {
+    parameters: [
+      "buffer", // buffer: *mut u8
+      "usize", // len: usize
+      "i32", // index: -1 for latest, 0..N for ring position
+    ],
+    result: "i32", // bytes written
+  },
 } as const;
 
 // Struct definitions for manual packing/unpacking if needed, or sizing

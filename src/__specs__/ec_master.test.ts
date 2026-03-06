@@ -429,6 +429,10 @@ const mockSymbols = {
   // THE CORE TEST TARGET:
   ethercrab_check_mailbox_resilient: (_idx: number, _addr: number, _lastToggle: number) => 0, // Default to empty
   ethercrab_get_last_emergency: (_buf: Uint8Array) => 1, // Default: No emergency
+  // Diagnostics
+  ethercrab_get_network_healthy: () => 1,
+  ethercrab_get_error_count: () => 0n,
+  ethercrab_get_error_detail: (_buf: Uint8Array, _len: bigint, _index: number) => 0,
 };
 
 // 3. Helper to create a Master with mocked FFI
@@ -578,6 +582,9 @@ const createCycleMockSymbols = (cyclicTxRxFn: () => number) => ({
   ethercrab_check_mailbox_resilient: () => 0,
   ethercrab_get_last_emergency: () => 1,
   ethercrab_cyclic_tx_rx: cyclicTxRxFn,
+  ethercrab_get_network_healthy: () => 1,
+  ethercrab_get_error_count: () => 0n,
+  ethercrab_get_error_detail: (_buf: Uint8Array, _len: bigint, _index: number) => 0,
 });
 
 function createCycleTestMaster(cyclicTxRxFn: () => number) {

@@ -1,7 +1,13 @@
+export interface ErrorContext {
+  [key: string]: string;
+}
+
 export class EtherCatError extends Error {
-  constructor(message: string) {
+  public context?: ErrorContext;
+  constructor(message: string, context?: ErrorContext) {
     super(message);
     this.name = "EtherCatError";
+    this.context = context;
   }
 }
 
@@ -13,15 +19,21 @@ export class PdoIntegrityError extends EtherCatError {
 }
 
 export class StateTransitionError extends EtherCatError {
-  constructor(message: string, public alStatusCode?: number) {
-    super(message);
+  constructor(
+    message: string,
+    public alStatusCode?: number,
+    public fromState?: string,
+    public toState?: string,
+    context?: ErrorContext,
+  ) {
+    super(message, context);
     this.name = "StateTransitionError";
   }
 }
 
 export class FfiError extends EtherCatError {
-  constructor(message: string, public code: number) {
-    super(`${message} (Code: ${code})`);
+  constructor(message: string, public code: number, context?: ErrorContext) {
+    super(`${message} (Code: ${code})`, context);
     this.name = "FfiError";
   }
 }

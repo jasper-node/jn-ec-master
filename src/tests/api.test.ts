@@ -39,6 +39,9 @@ function setupMocks() {
         ethercrab_get_last_emergency: (_buf: any) => 0, // Sync
         is_raw_socket_available: () => 1, // Sync
         ethercrab_get_last_error: (_buf: any, _len: any) => 0, // Sync
+        ethercrab_get_network_healthy: () => 1,
+        ethercrab_get_error_count: () => 0n,
+        ethercrab_get_error_detail: (_buf: any, _len: any, _index: any) => 0,
         ethercrab_version: (buf: Uint8Array, _len: any) => {
           const encoded = new TextEncoder().encode(EcMaster.REQUIRED_FFI_VERSION);
           buf.set(encoded);

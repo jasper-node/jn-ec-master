@@ -11,6 +11,7 @@ export {
   PdoIntegrityError,
   StateTransitionError,
 } from "./src/types/errors.ts";
+export type { ErrorContext } from "./src/types/errors.ts";
 
 // Export ENI loader utilities
 export { loadEniFromXml, parseEniJson } from "./src/utils/eni-loader.ts";

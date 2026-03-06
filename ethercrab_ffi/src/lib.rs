@@ -2,7 +2,7 @@ use std::ffi::{CStr, c_char, c_int};
 use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::thread::JoinHandle;
 use ethercrab::{
     MainDevice, MainDeviceConfig, PduStorage, Timeouts, std::ethercat_now,
@@ -32,12 +32,13 @@ struct EcMasterState {
     maindevice: Arc<MainDevice<'static>>,
     group: Option<GroupState>,
     // Wrapped in RwLock for interior mutability, Arc for stable address
-    pdi_buffer: Arc<RwLock<[u8; MAX_PDI]>>, 
+    pdi_buffer: Arc<RwLock<[u8; MAX_PDI]>>,
     pdi_size: usize,
     input_size: usize,
     output_size: usize,
     expected_wkc: u16,
     mailbox_poll_interval_ms: Option<u32>,
+    pdu_timeout_ms: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -52,9 +53,165 @@ static STATE: Lazy<RwLock<Option<EcMasterState>>> = Lazy::new(|| RwLock::new(Non
 static GLOBAL_DEVICE: Lazy<RwLock<Option<Arc<MainDevice<'static>>>>> = Lazy::new(|| RwLock::new(None));
 // Track TX/RX thread resources globally so they can be cleaned up even if STATE is never set
 static TX_RX_RESOURCES: Lazy<Mutex<Option<TxRxResources>>> = Lazy::new(|| Mutex::new(None));
-static LAST_ERROR: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 static LAST_EMERGENCY: Lazy<Mutex<Option<InternalEmergencyInfo>>> = Lazy::new(|| Mutex::new(None));
 static NETWORK_HEALTHY: AtomicBool = AtomicBool::new(true);
+
+// --- Structured Error Infrastructure ---
+
+/// Error classification codes for programmatic handling.
+/// These are metadata in the error ring — separate from FFI function return codes.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug)]
+pub enum FfiErrorCode {
+    Unspecified = 0,
+    NotInitialized = 1,
+    InvalidArgument = 2,
+    PanicCaught = 3,
+    PduTimeout = 10,
+    WkcMismatch = 11,
+    NetworkError = 12,
+    InterfaceError = 13,
+    StateTransitionFailed = 20,
+    SdoError = 30,
+    EepromError = 31,
+    RegisterError = 32,
+    ResourceBusy = 40,
+    PermissionDenied = 41,
+}
+
+#[derive(Clone)]
+struct ErrorEntry {
+    code: FfiErrorCode,
+    message: String,
+    context_json: String,
+    timestamp_ms: u64,
+}
+
+const ERROR_RING_SIZE: usize = 16;
+
+struct ErrorRing {
+    entries: Vec<Option<ErrorEntry>>,
+    write_idx: usize,
+    total_count: u64,
+}
+
+impl ErrorRing {
+    fn new() -> Self {
+        Self {
+            entries: (0..ERROR_RING_SIZE).map(|_| None).collect(),
+            write_idx: 0,
+            total_count: 0,
+        }
+    }
+
+    fn push(&mut self, entry: ErrorEntry) {
+        let idx = self.write_idx % ERROR_RING_SIZE;
+        self.entries[idx] = Some(entry);
+        self.write_idx += 1;
+        self.total_count += 1;
+    }
+
+    fn latest(&self) -> Option<&ErrorEntry> {
+        if self.write_idx == 0 {
+            return None;
+        }
+        let idx = (self.write_idx - 1) % ERROR_RING_SIZE;
+        self.entries[idx].as_ref()
+    }
+
+    fn get(&self, index: usize) -> Option<&ErrorEntry> {
+        if self.write_idx == 0 || index >= ERROR_RING_SIZE {
+            return None;
+        }
+        // Index 0 = oldest available, higher = newer
+        let available = self.write_idx.min(ERROR_RING_SIZE);
+        if index >= available {
+            return None;
+        }
+        let start = if self.write_idx > ERROR_RING_SIZE {
+            self.write_idx - ERROR_RING_SIZE
+        } else {
+            0
+        };
+        let actual_idx = (start + index) % ERROR_RING_SIZE;
+        self.entries[actual_idx].as_ref()
+    }
+}
+
+static ERROR_RING: Lazy<Mutex<ErrorRing>> = Lazy::new(|| Mutex::new(ErrorRing::new()));
+static ERROR_EPOCH: Lazy<Instant> = Lazy::new(Instant::now);
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn build_context_json(pairs: &[(&str, &str)]) -> String {
+    if pairs.is_empty() {
+        return String::new();
+    }
+    let fields: Vec<String> = pairs.iter()
+        .map(|(k, v)| format!("\"{}\":\"{}\"", k, json_escape(v)))
+        .collect();
+    format!("{{{}}}", fields.join(","))
+}
+
+/// Push an error with classification and structured context.
+fn set_error_ctx(code: FfiErrorCode, msg: impl std::fmt::Display, ctx: &[(&str, &str)]) {
+    let timestamp_ms = ERROR_EPOCH.elapsed().as_millis() as u64;
+    let context_json = build_context_json(ctx);
+    ERROR_RING.lock().push(ErrorEntry {
+        code,
+        message: msg.to_string(),
+        context_json,
+        timestamp_ms,
+    });
+}
+
+/// Legacy helper — pushes an Unspecified error with no structured context.
+fn set_error(err: impl std::fmt::Display) {
+    set_error_ctx(FfiErrorCode::Unspecified, err, &[]);
+}
+
+/// Format the error entry for `ethercrab_get_last_error`.
+/// Returns "message" or "message||{context_json}" if context exists.
+fn format_error_for_ffi(entry: &ErrorEntry) -> String {
+    if entry.context_json.is_empty() {
+        entry.message.clone()
+    } else {
+        format!("{}||{}", entry.message, entry.context_json)
+    }
+}
+
+fn state_name(target: u8) -> &'static str {
+    match target {
+        0 => "Init",
+        1 => "PreOp",
+        2 => "SafeOp",
+        3 => "Op",
+        _ => "Unknown",
+    }
+}
+
+#[allow(dead_code)]
+fn group_state_name(g: &Option<GroupState>) -> &'static str {
+    match g {
+        Some(GroupState::PreOp(_)) => "PreOp",
+        Some(GroupState::SafeOp(_)) => "SafeOp",
+        Some(GroupState::Op(_)) => "Op",
+        None => "None",
+    }
+}
 
 // Resources for TX/RX thread cleanup (stored globally for cleanup even on partial init failure)
 struct TxRxResources {
@@ -63,12 +220,7 @@ struct TxRxResources {
     storage_ptr: usize,
 }
 
-fn set_error(err: impl std::fmt::Display) {
-    let mut guard = LAST_ERROR.lock();
-    *guard = err.to_string();
-}
-
-fn panic_message(panic: Box<dyn Any + Send>) -> String {
+fn panic_message(panic: &Box<dyn Any + Send>) -> String {
     if let Some(s) = panic.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = panic.downcast_ref::<String>() {
@@ -85,7 +237,12 @@ where
     match std::panic::catch_unwind(f) {
         Ok(value) => value,
         Err(panic) => {
-            set_error(format!("FFI panic: {}", panic_message(panic)));
+            let msg = panic_message(&panic);
+            set_error_ctx(
+                FfiErrorCode::PanicCaught,
+                format!("FFI panic: {}", msg),
+                &[("panic_info", &msg)],
+            );
             default
         }
     }
@@ -286,11 +443,63 @@ pub extern "C" fn ethercrab_get_last_error(buffer: *mut u8, len: usize) -> c_int
         if buffer.is_null() || len == 0 {
             return 0;
         }
-        let guard = LAST_ERROR.lock();
-        let error_bytes = guard.as_bytes();
+        let ring = ERROR_RING.lock();
+        let formatted = match ring.latest() {
+            Some(entry) => format_error_for_ffi(entry),
+            None => return 0,
+        };
+        let error_bytes = formatted.as_bytes();
         let to_copy = error_bytes.len().min(len);
         unsafe {
             std::ptr::copy_nonoverlapping(error_bytes.as_ptr(), buffer, to_copy);
+        }
+        to_copy as c_int
+    })
+}
+
+/// Returns 1 if the network is healthy, 0 if not.
+#[no_mangle]
+pub extern "C" fn ethercrab_get_network_healthy() -> c_int {
+    if NETWORK_HEALTHY.load(Ordering::Relaxed) { 1 } else { 0 }
+}
+
+/// Returns the total number of errors recorded since process start.
+#[no_mangle]
+pub extern "C" fn ethercrab_get_error_count() -> u64 {
+    ERROR_RING.lock().total_count
+}
+
+/// Get a specific error from the ring buffer as JSON.
+/// index: 0 = oldest available, use ethercrab_get_error_count to find range.
+/// Pass index = -1 (as u32::MAX) for the latest error.
+/// Returns bytes written, or 0 if no error at that index.
+#[no_mangle]
+pub extern "C" fn ethercrab_get_error_detail(buffer: *mut u8, len: usize, index: i32) -> c_int {
+    with_ffi_guard(0, || {
+        if buffer.is_null() || len == 0 {
+            return 0;
+        }
+        let ring = ERROR_RING.lock();
+        let entry = if index < 0 {
+            ring.latest()
+        } else {
+            ring.get(index as usize)
+        };
+        let entry = match entry {
+            Some(e) => e,
+            None => return 0,
+        };
+        let json = format!(
+            "{{\"code\":{},\"message\":\"{}\",\"context\":{},\"timestamp_ms\":{}}}",
+            entry.code as u8,
+            json_escape(&entry.message),
+            if entry.context_json.is_empty() { "null".to_string() } else { entry.context_json.clone() },
+            entry.timestamp_ms,
+        );
+        let json_bytes = json.as_bytes();
+        let to_copy = json_bytes.len().min(len);
+        unsafe {
+            std::ptr::copy_nonoverlapping(json_bytes.as_ptr(), buffer, to_copy);
         }
         to_copy as c_int
     })
@@ -367,7 +576,7 @@ pub extern "C" fn ethercrab_init(
             match CStr::from_ptr(interface).to_str() {
                 Ok(s) => s.to_string(),
                 Err(e) => {
-                    set_error(format!("Invalid interface string: {}", e));
+                    set_error_ctx(FfiErrorCode::InvalidArgument, format!("Invalid interface string: {}", e), &[("op", "init")]);
                     return -2;
                 }
             }
@@ -448,7 +657,7 @@ pub extern "C" fn ethercrab_init(
                                 }));
 
                                 if let Err(panic) = result {
-                                    set_error(format!("TX/RX thread panicked: {}", panic_message(panic)));
+                                    set_error(format!("TX/RX thread panicked: {}", panic_message(&panic)));
                                     NETWORK_HEALTHY.store(false, Ordering::Relaxed);
                                 }
                             })
@@ -546,7 +755,7 @@ pub extern "C" fn ethercrab_init(
                                 }));
 
                                 if let Err(panic) = result {
-                                    set_error(format!("TX/RX thread panicked: {}", panic_message(panic)));
+                                    set_error(format!("TX/RX thread panicked: {}", panic_message(&panic)));
                                     NETWORK_HEALTHY.store(false, Ordering::Relaxed);
                                 }
                             })
@@ -575,7 +784,11 @@ pub extern "C" fn ethercrab_init(
             // Init Group
             let group = maindevice.init_single_group::<MAX_SUBDEVICES, MAX_PDI>(ethercat_now)
                 .await.map_err(|e| {
-                    set_error(format!("Failed to init single group: {:?}", e));
+                    set_error_ctx(
+                        FfiErrorCode::NetworkError,
+                        format!("Failed to init single group: {:?}", e),
+                        &[("op", "init"), ("step", "init_single_group"), ("interface", &interface_str), ("error_detail", &format!("{:?}", e)), ("suggestion", "Check network interface name, cable connections, and that slaves are powered on")],
+                    );
                     -5
                 })?;
 
@@ -604,6 +817,7 @@ pub extern "C" fn ethercrab_init(
                 output_size: 0,
                 expected_wkc: 0,
                 mailbox_poll_interval_ms: None,
+                pdu_timeout_ms,
             };
 
             let mut guard = STATE.write();
@@ -679,7 +893,11 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
             if target_state == 0 || target_state == 1 {
                 return 0;
             }
-            set_error("No master available for state transition");
+            set_error_ctx(
+                FfiErrorCode::NotInitialized,
+                format!("No master available for state transition to {}", state_name(target_state)),
+                &[("op", "request_state"), ("target_state", state_name(target_state))],
+            );
             return -1;
         }
 
@@ -706,7 +924,11 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
                     let g_safe = match g.into_safe_op(&maindevice).await {
                         Ok(g) => g,
                         Err(e) => {
-                            set_error(format!("into_safe_op failed: {:?}", e));
+                            set_error_ctx(
+                                FfiErrorCode::StateTransitionFailed,
+                                format!("State transition PreOp→SafeOp failed: {:?}", e),
+                                &[("op", "request_state"), ("from", "PreOp"), ("to", "SafeOp"), ("error_detail", &format!("{:?}", e)), ("suggestion", "Increase runtimeOptions.stateTransitionTimeoutMs or check slave AL status")],
+                            );
                             return Err(-3);
                         }
                     };
@@ -731,7 +953,11 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
                     let g_safe = match g.into_safe_op(&maindevice).await {
                         Ok(g) => g,
                         Err(e) => {
-                            set_error(format!("into_safe_op failed: {:?}", e));
+                            set_error_ctx(
+                                FfiErrorCode::StateTransitionFailed,
+                                format!("State transition Op→SafeOp failed: {:?}", e),
+                                &[("op", "request_state"), ("from", "Op"), ("to", "SafeOp"), ("error_detail", &format!("{:?}", e)), ("suggestion", "Increase runtimeOptions.stateTransitionTimeoutMs or check slave AL status")],
+                            );
                             return Err(-3);
                         }
                     };
@@ -743,7 +969,11 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
                     let g_op = match g.into_op(&maindevice).await {
                         Ok(g) => g,
                         Err(e) => {
-                            set_error(format!("into_op failed: {:?}", e));
+                            set_error_ctx(
+                                FfiErrorCode::StateTransitionFailed,
+                                format!("State transition SafeOp→Op failed: {:?}", e),
+                                &[("op", "request_state"), ("from", "SafeOp"), ("to", "Op"), ("error_detail", &format!("{:?}", e)), ("suggestion", "Increase runtimeOptions.stateTransitionTimeoutMs or check slave AL status")],
+                            );
                             return Err(-3);
                         }
                     };
@@ -759,7 +989,11 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
                             let g_pre = match g.into_pre_op(&maindevice).await {
                                 Ok(g) => g,
                                 Err(e) => {
-                                    set_error(format!("into_pre_op failed: {:?}", e));
+                                    set_error_ctx(
+                                        FfiErrorCode::StateTransitionFailed,
+                                        format!("State transition SafeOp→PreOp failed: {:?}", e),
+                                        &[("op", "request_state"), ("from", "SafeOp"), ("to", "PreOp"), ("error_detail", &format!("{:?}", e)), ("suggestion", "Increase runtimeOptions.stateTransitionTimeoutMs or check slave AL status")],
+                                    );
                                     return Err(-3);
                                 }
                             };
@@ -770,14 +1004,22 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
                             let g_safe = match g.into_safe_op(&maindevice).await {
                                 Ok(g) => g,
                                 Err(e) => {
-                                    set_error(format!("into_safe_op failed: {:?}", e));
+                                    set_error_ctx(
+                                        FfiErrorCode::StateTransitionFailed,
+                                        format!("State transition Op→SafeOp failed (during Op→PreOp): {:?}", e),
+                                        &[("op", "request_state"), ("from", "Op"), ("to", "PreOp"), ("step", "Op→SafeOp"), ("error_detail", &format!("{:?}", e)), ("suggestion", "Increase runtimeOptions.stateTransitionTimeoutMs or check slave AL status")],
+                                    );
                                     return Err(-3);
                                 }
                             };
                             let g_pre = match g_safe.into_pre_op(&maindevice).await {
                                 Ok(g) => g,
                                 Err(e) => {
-                                    set_error(format!("into_pre_op failed: {:?}", e));
+                                    set_error_ctx(
+                                        FfiErrorCode::StateTransitionFailed,
+                                        format!("State transition SafeOp→PreOp failed (during Op→PreOp): {:?}", e),
+                                        &[("op", "request_state"), ("from", "Op"), ("to", "PreOp"), ("step", "SafeOp→PreOp"), ("error_detail", &format!("{:?}", e)), ("suggestion", "Increase runtimeOptions.stateTransitionTimeoutMs or check slave AL status")],
+                                    );
                                     return Err(-3);
                                 }
                             };
@@ -793,7 +1035,11 @@ pub extern "C" fn ethercrab_request_state(target_state: u8) -> c_int {
                 }, 
 
                 (_, None) => {
-                    set_error("No group available for state transition");
+                    set_error_ctx(
+                        FfiErrorCode::NotInitialized,
+                        format!("No group available for state transition to {}", state_name(target_state)),
+                        &[("op", "request_state"), ("target_state", state_name(target_state))],
+                    );
                     Err(-2)
                 },
             }
@@ -958,7 +1204,20 @@ pub extern "C" fn ethercrab_cyclic_tx_rx() -> c_int {
             },
             Err(e) => {
                 NETWORK_HEALTHY.store(false, Ordering::Relaxed);
-                set_error(format!("Cyclic tx_rx failed: {:?}", e));
+                let err_detail = format!("{:?}", e);
+                let expected_wkc = state.expected_wkc;
+                let pdu_timeout = state.pdu_timeout_ms;
+                set_error_ctx(
+                    FfiErrorCode::PduTimeout,
+                    format!("Cyclic tx_rx failed: {}", err_detail),
+                    &[
+                        ("op", "cyclic_tx_rx"),
+                        ("expected_wkc", &expected_wkc.to_string()),
+                        ("pdu_timeout_ms", &pdu_timeout.to_string()),
+                        ("error_detail", &err_detail),
+                        ("suggestion", "Increase runtimeOptions.pduTimeoutMs, increase master.cycleTime, or check slave wiring"),
+                    ],
+                );
                 return -2;
             },
         };
@@ -1008,32 +1267,43 @@ pub extern "C" fn ethercrab_sdo_read(
             
             // Generic helper to read
             async fn read_sdo(
-                group: &GroupState, 
-                md: &MainDevice<'_>, 
-                idx: usize, 
-                i: u16, 
+                group: &GroupState,
+                md: &MainDevice<'_>,
+                idx: usize,
+                i: u16,
                 si: u8
             ) -> Result<[u8; 4], i32> {
+                let sdo_err = |e: ethercrab::error::Error| {
+                    let err_detail = format!("{:?}", e);
+                    set_error_ctx(
+                        FfiErrorCode::SdoError,
+                        format!("SDO read failed on slave {} (0x{:04X}:{}): {}", idx, i, si, err_detail),
+                        &[
+                            ("op", "sdo_read"),
+                            ("slave_index", &idx.to_string()),
+                            ("sdo_index", &format!("0x{:04X}", i)),
+                            ("sdo_sub_index", &si.to_string()),
+                            ("error_detail", &err_detail),
+                            ("suggestion", "Verify SDO index/sub-index exist on slave. Try increasing runtimeOptions.mailboxResponseTimeoutMs"),
+                        ],
+                    );
+                    -3
+                };
                 match group {
-                    GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_read(i, si).await.map_err(|e| {
-                        set_error(format!("SDO read failed: {:?}", e));
-                        -3
-                    }),
-                    GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_read(i, si).await.map_err(|e| {
-                         set_error(format!("SDO read failed: {:?}", e));
-                        -3
-                    }),
-                    GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_read(i, si).await.map_err(|e| {
-                         set_error(format!("SDO read failed: {:?}", e));
-                        -3
-                    }),
+                    GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_read(i, si).await.map_err(sdo_err),
+                    GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_read(i, si).await.map_err(sdo_err),
+                    GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_read(i, si).await.map_err(sdo_err),
                 }
             }
 
             match state.group.as_ref() {
                 Some(group) => read_sdo(group, &state.maindevice, idx, index, sub_index).await,
                 None => {
-                    set_error("No group available for SDO read");
+                    set_error_ctx(
+                        FfiErrorCode::NotInitialized,
+                        format!("No group available for SDO read on slave {} (0x{:04X}:{})", idx, index, sub_index),
+                        &[("op", "sdo_read"), ("slave_index", &idx.to_string())],
+                    );
                     Err(-2)
                 }
             }
@@ -1076,31 +1346,53 @@ pub extern "C" fn ethercrab_sdo_write(
             let g = match state.group.as_ref() {
                 Some(g) => g,
                 None => {
-                    set_error("No group available for SDO write");
+                    set_error_ctx(
+                        FfiErrorCode::NotInitialized,
+                        format!("No group available for SDO write on slave {} (0x{:04X}:{})", idx, index, sub_index),
+                        &[("op", "sdo_write"), ("slave_index", &idx.to_string())],
+                    );
                     return Err(-2);
                 }
             };
-            
+
+            let sdo_err = |e: ethercrab::error::Error| {
+                let err_detail = format!("{:?}", e);
+                set_error_ctx(
+                    FfiErrorCode::SdoError,
+                    format!("SDO write failed on slave {} (0x{:04X}:{}): {}", idx, index, sub_index, err_detail),
+                    &[
+                        ("op", "sdo_write"),
+                        ("slave_index", &idx.to_string()),
+                        ("sdo_index", &format!("0x{:04X}", index)),
+                        ("sdo_sub_index", &sub_index.to_string()),
+                        ("data_len", &len.to_string()),
+                        ("error_detail", &err_detail),
+                        ("suggestion", "Verify SDO index/sub-index exist and are writable. Try increasing runtimeOptions.mailboxResponseTimeoutMs"),
+                    ],
+                );
+                -3
+            };
+
             match len {
                 1 => match g {
-                    GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, data_buf[0]).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-                    GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, data_buf[0]).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-                    GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, data_buf[0]).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
+                    GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, data_buf[0]).await.map_err(&sdo_err),
+                    GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, data_buf[0]).await.map_err(&sdo_err),
+                    GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, data_buf[0]).await.map_err(&sdo_err),
                 },
                 2 => {
                     let val = u16::from_le_bytes([data_buf[0], data_buf[1]]);
                     match g {
-                        GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-                        GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-                        GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
+                        GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(&sdo_err),
+                        GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(&sdo_err),
+                        GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(&sdo_err),
                     }
                 },
                 4 => {
                     let val = u32_from_bytes(data_buf);
                     match g {
-                        GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-                        GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
-                        GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(|e| { set_error(format!("SDO write failed: {:?}", e)); -3 }),
+                        GroupState::PreOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(&sdo_err),
+                        GroupState::SafeOp(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(&sdo_err),
+                        GroupState::Op(g) => g.iter(md).nth(idx).ok_or(-2)?.sdo_write(index, sub_index, val).await.map_err(&sdo_err),
                     }
                 },
                 _ => return Err(-4)
@@ -1138,7 +1430,11 @@ pub extern "C" fn ethercrab_eeprom_read(
             let group = match state.group.as_ref() {
                 Some(g) => g,
                 None => {
-                    set_error("No group available for EEPROM read");
+                    set_error_ctx(
+                        FfiErrorCode::NotInitialized,
+                        format!("No group available for EEPROM read on slave {}", slave_index),
+                        &[("op", "eeprom_read"), ("slave_index", &slave_index.to_string())],
+                    );
                     return Err(-2);
                 }
             };
@@ -1152,7 +1448,18 @@ pub extern "C" fn ethercrab_eeprom_read(
             match read_res {
                  Ok(bytes) => Ok((bytes, buffer)),
                  Err(e) => {
-                     set_error(format!("EEPROM read failed: {:?}", e));
+                     set_error_ctx(
+                         FfiErrorCode::EepromError,
+                         format!("EEPROM read failed on slave {} at address 0x{:04X}: {:?}", slave_index, address, e),
+                         &[
+                             ("op", "eeprom_read"),
+                             ("slave_index", &slave_index.to_string()),
+                             ("address", &format!("0x{:04X}", address)),
+                             ("length", &len.to_string()),
+                             ("error_detail", &format!("{:?}", e)),
+                             ("suggestion", "Try increasing runtimeOptions.eepromTimeoutMs"),
+                         ],
+                     );
                      Err(-3)
                  }
             }
@@ -1440,7 +1747,17 @@ pub extern "C" fn ethercrab_register_read_u16(
             match val_res {
                 Ok(val) => Ok(val as i32),
                 Err(e) => {
-                    set_error(format!("Register read failed: {:?}", e));
+                    set_error_ctx(
+                        FfiErrorCode::RegisterError,
+                        format!("Register read failed on slave {} at 0x{:04X}: {:?}", slave_index, register_address, e),
+                        &[
+                            ("op", "register_read"),
+                            ("slave_index", &slave_index.to_string()),
+                            ("register", &format!("0x{:04X}", register_address)),
+                            ("error_detail", &format!("{:?}", e)),
+                            ("suggestion", "Check slave is reachable and register address is valid"),
+                        ],
+                    );
                     Err(-3)
                 }
             }
@@ -1486,7 +1803,18 @@ pub extern "C" fn ethercrab_register_write_u16(
             match write_res {
                 Ok(_) => Ok(0),
                 Err(e) => {
-                    set_error(format!("Register write failed: {:?}", e));
+                    set_error_ctx(
+                        FfiErrorCode::RegisterError,
+                        format!("Register write failed on slave {} at 0x{:04X} (value={}): {:?}", slave_index, register_address, value, e),
+                        &[
+                            ("op", "register_write"),
+                            ("slave_index", &slave_index.to_string()),
+                            ("register", &format!("0x{:04X}", register_address)),
+                            ("value", &value.to_string()),
+                            ("error_detail", &format!("{:?}", e)),
+                            ("suggestion", "Check slave is reachable and register address is writable"),
+                        ],
+                    );
                     Err(-3)
                 }
             }
@@ -1947,7 +2275,7 @@ pub extern "C" fn ethercrab_scan_new(interface: *const c_char) -> *mut ScanConte
                         }));
 
                         if let Err(panic) = result {
-                            set_error(format!("Scan TX/RX thread panicked: {}", panic_message(panic)));
+                            set_error(format!("Scan TX/RX thread panicked: {}", panic_message(&panic)));
                         }
                     })
                     .map_err(|e| {

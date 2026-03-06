@@ -58,6 +58,9 @@ function setupMocks(customSymbols?: MockSymbols) {
           ((_idx: any, _addr: any, _toggle: any) => Promise.resolve(0)), // Default: empty
         is_raw_socket_available: () => 1,
         ethercrab_get_last_error: (_buf: any, _len: any) => 0,
+        ethercrab_get_network_healthy: () => 1,
+        ethercrab_get_error_count: () => 0n,
+        ethercrab_get_error_detail: (_buf: any, _len: any, _index: any) => 0,
         ethercrab_version: (buf: Uint8Array, _len: any) => {
           const encoded = new TextEncoder().encode(EcMaster.REQUIRED_FFI_VERSION);
           buf.set(encoded);
