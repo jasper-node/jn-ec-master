@@ -3,7 +3,12 @@ import { assertSpyCall, spy, stub } from "@std/testing/mock";
 import { EcMaster } from "../ec_master.ts";
 import type { EniConfig } from "../types/eni-config.ts";
 import type { EmergencyEvent } from "../types/ec_types.ts";
-import { EtherCatError, FfiError, PdoIntegrityError, StateTransitionError } from "../types/errors.ts";
+import {
+  EtherCatError,
+  FfiError,
+  PdoIntegrityError,
+  StateTransitionError,
+} from "../types/errors.ts";
 
 /**
  * Tests for startEmergencyPolling method (lines 878-879)
