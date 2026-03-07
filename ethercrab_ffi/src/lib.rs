@@ -2257,7 +2257,9 @@ pub extern "C" fn ethercrab_scan_new(interface: *const c_char) -> *mut ScanConte
                 // Validate interface before spawning thread (with scan-specific error and cleanup)
                 if let Err(_) = validate_windows_interface(&iface) {
                     // Add NPF hint to error message for scan
-                    let existing_err = LAST_ERROR.lock().clone();
+                    let existing_err = ERROR_RING.lock().latest()
+                        .map(|e| e.message.clone())
+                        .unwrap_or_default();
                     set_error(format!("{} (Try using NPF IDs)", existing_err));
                     unsafe { let _ = Box::from_raw(storage_ptr); }
                     return Err(-1);
