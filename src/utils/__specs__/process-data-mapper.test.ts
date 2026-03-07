@@ -714,3 +714,189 @@ Deno.test("buildProcessDataMappings - handles complex multi-slave scenario", () 
   assertEquals(mappings.get("S2.In1")?.slaveIndex, 2);
   assertEquals(mappings.get("S2.In1")?.pdiByteOffset, 4); // outputSize (3) + 1
 });
+
+// --- Name-based fallback tests ---
+
+Deno.test("buildProcessDataMappings - name fallback: matches outputs when processData is missing", () => {
+  const config: EniConfig = {
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
+    slaves: [
+      { name: "EK1100" }, // coupler, no I/O
+      { name: "XI211208" },
+      { name: "EL2008" },
+    ],
+    processImage: {
+      outputs: {
+        byteSize: 2,
+        variables: [
+          { name: "XI211208.Output_PDO_0", dataType: "BOOL", bitSize: 1, bitOffset: 0 },
+          { name: "XI211208.Output_PDO_1", dataType: "BOOL", bitSize: 1, bitOffset: 1 },
+          { name: "EL2008.Output_PDO_0", dataType: "BOOL", bitSize: 1, bitOffset: 8 },
+        ],
+      },
+      inputs: { byteSize: 0, variables: [] },
+    },
+  };
+
+  const mappings = buildProcessDataMappings(config);
+  assertEquals(mappings.size, 3);
+
+  const xi = mappings.get("XI211208.Output_PDO_0");
+  assertExists(xi);
+  assertEquals(xi.slaveIndex, 2); // index 1 in array, +1 = 2
+  assertEquals(xi.isInput, false);
+  assertEquals(xi.bitOffset, 0);
+
+  const el = mappings.get("EL2008.Output_PDO_0");
+  assertExists(el);
+  assertEquals(el.slaveIndex, 3); // index 2 in array, +1 = 3
+  assertEquals(el.pdiByteOffset, 1);
+});
+
+Deno.test("buildProcessDataMappings - name fallback: matches inputs when processData is missing", () => {
+  const config: EniConfig = {
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
+    slaves: [
+      { name: "EL3062" },
+    ],
+    processImage: {
+      outputs: { byteSize: 2, variables: [] },
+      inputs: {
+        byteSize: 4,
+        variables: [
+          { name: "EL3062.Value", dataType: "UINT16", bitSize: 16, bitOffset: 0 },
+        ],
+      },
+    },
+  };
+
+  const mappings = buildProcessDataMappings(config);
+  assertEquals(mappings.size, 1);
+
+  const mapping = mappings.get("EL3062.Value");
+  assertExists(mapping);
+  assertEquals(mapping.slaveIndex, 1);
+  assertEquals(mapping.isInput, true);
+  assertEquals(mapping.pdiByteOffset, 2); // outputSize (2) + 0
+});
+
+Deno.test("buildProcessDataMappings - name fallback: skips variables with no dot separator", () => {
+  const config: EniConfig = {
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
+    slaves: [{ name: "Slave1" }],
+    processImage: {
+      outputs: {
+        byteSize: 1,
+        variables: [
+          { name: "NoDotName", dataType: "BYTE", bitSize: 8, bitOffset: 0 },
+        ],
+      },
+      inputs: { byteSize: 0, variables: [] },
+    },
+  };
+
+  const mappings = buildProcessDataMappings(config);
+  assertEquals(mappings.size, 0);
+});
+
+Deno.test("buildProcessDataMappings - name fallback: prefers processData match over name match", () => {
+  // Slave order: [SlaveA, SlaveB] but SlaveA's processData covers bitOffset 8
+  // Variable "SlaveA.Out" at bitOffset 8 should match via processData (SlaveA at index 0)
+  // even though name also matches SlaveA
+  const config: EniConfig = {
+    master: { cycleTime: 1000, runtimeOptions: { networkInterface: "eth0" } },
+    slaves: [
+      {
+        name: "SlaveA",
+        processData: { outputOffset: 1, outputBitLength: 8 },
+      },
+      {
+        name: "SlaveB",
+        processData: { outputOffset: 0, outputBitLength: 8 },
+      },
+    ],
+    processImage: {
+      outputs: {
+        byteSize: 2,
+        variables: [
+          { name: "SlaveA.Out", dataType: "BYTE", bitSize: 8, bitOffset: 8 },
+        ],
+      },
+      inputs: { byteSize: 0, variables: [] },
+    },
+  };
+
+  const mappings = buildProcessDataMappings(config);
+  assertEquals(mappings.size, 1);
+  // processData says bitOffset 8 belongs to SlaveA (offset 1 * 8 = 8), index 0, +1 = 1
+  assertEquals(mappings.get("SlaveA.Out")?.slaveIndex, 1);
+});
+
+Deno.test("buildProcessDataMappings - name fallback: real-world config with stripped processData", () => {
+  // Mirrors the actual JN config that triggered this issue
+  const config: EniConfig = {
+    master: { cycleTime: 25000, runtimeOptions: { networkInterface: "en5" } },
+    slaves: [
+      { name: "XB-EC-12", physAddr: 4096, vendorId: 36, productCode: 2370063 },
+      { name: "XI110208", physAddr: 4097, vendorId: 36, productCode: 2370051 },
+      { name: "XI211208", physAddr: 4098, vendorId: 36, productCode: 2370049 },
+      { name: "XI332204", physAddr: 4099, vendorId: 36, productCode: 2370061 },
+      { name: "EK1100", physAddr: 4100, vendorId: 2, productCode: 72100946 },
+      { name: "EL3062", physAddr: 4101, vendorId: 2, productCode: 200683602 },
+      { name: "EK1100", physAddr: 4102, vendorId: 2, productCode: 72100946 },
+      { name: "EL2008", physAddr: 4103, vendorId: 2, productCode: 131608658 },
+      { name: "EL4002", physAddr: 4104, vendorId: 2, productCode: 262287442 },
+    ],
+    processImage: {
+      inputs: { byteSize: 49, variables: [] },
+      outputs: {
+        byteSize: 6,
+        variables: [
+          { name: "XI211208.Output_PDO_0", dataType: "BOOL", bitSize: 1, bitOffset: 0 },
+          { name: "XI211208.Output_PDO_1", dataType: "BOOL", bitSize: 1, bitOffset: 1 },
+          { name: "XI211208.Output_PDO_2", dataType: "BOOL", bitSize: 1, bitOffset: 2 },
+          { name: "XI211208.Output_PDO_3", dataType: "BOOL", bitSize: 1, bitOffset: 3 },
+          { name: "XI211208.Output_PDO_4", dataType: "BOOL", bitSize: 1, bitOffset: 4 },
+          { name: "XI211208.Output_PDO_5", dataType: "BOOL", bitSize: 1, bitOffset: 5 },
+          { name: "XI211208.Output_PDO_6", dataType: "BOOL", bitSize: 1, bitOffset: 6 },
+          { name: "XI211208.Output_PDO_7", dataType: "BOOL", bitSize: 1, bitOffset: 7 },
+          { name: "EL2008.Output_PDO_0", dataType: "BOOL", bitSize: 1, bitOffset: 8 },
+          { name: "EL2008.Output_PDO_1", dataType: "BOOL", bitSize: 1, bitOffset: 9 },
+          { name: "EL2008.Output_PDO_2", dataType: "BOOL", bitSize: 1, bitOffset: 10 },
+          { name: "EL2008.Output_PDO_3", dataType: "BOOL", bitSize: 1, bitOffset: 11 },
+          { name: "EL2008.Output_PDO_4", dataType: "BOOL", bitSize: 1, bitOffset: 12 },
+          { name: "EL2008.Output_PDO_5", dataType: "BOOL", bitSize: 1, bitOffset: 13 },
+          { name: "EL2008.Output_PDO_6", dataType: "BOOL", bitSize: 1, bitOffset: 14 },
+          { name: "EL2008.Output_PDO_7", dataType: "BOOL", bitSize: 1, bitOffset: 15 },
+          { name: "EL4002.Entry_0x7000_01", dataType: "UINT16", bitSize: 16, bitOffset: 16 },
+          { name: "EL4002.Entry_0x7010_01", dataType: "UINT16", bitSize: 16, bitOffset: 32 },
+        ],
+      },
+    },
+  };
+
+  const mappings = buildProcessDataMappings(config);
+
+  // All 18 output variables should be mapped
+  assertEquals(mappings.size, 18);
+
+  // Spot-check slave assignments
+  assertEquals(mappings.get("XI211208.Output_PDO_0")?.slaveIndex, 3); // index 2 + 1
+  assertEquals(mappings.get("XI211208.Output_PDO_2")?.slaveIndex, 3);
+  assertEquals(mappings.get("EL2008.Output_PDO_0")?.slaveIndex, 8); // index 7 + 1
+  assertEquals(mappings.get("EL4002.Entry_0x7000_01")?.slaveIndex, 9); // index 8 + 1
+
+  // Check BOOL bit offsets
+  assertEquals(mappings.get("XI211208.Output_PDO_2")?.bitOffset, 2);
+  assertEquals(mappings.get("EL2008.Output_PDO_3")?.bitOffset, 3);
+
+  // Check UINT16 has no bitOffset
+  assertEquals(mappings.get("EL4002.Entry_0x7000_01")?.bitOffset, undefined);
+  assertEquals(mappings.get("EL4002.Entry_0x7000_01")?.pdiByteOffset, 2);
+  assertEquals(mappings.get("EL4002.Entry_0x7010_01")?.pdiByteOffset, 4);
+
+  // No input mappings (variables array is empty)
+  for (const mapping of mappings.values()) {
+    assertEquals(mapping.isInput, false);
+  }
+});

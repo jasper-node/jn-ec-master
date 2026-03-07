@@ -35,6 +35,21 @@ function matchVariableToSlave(
 }
 
 /**
+ * Fallback: match a variable to a slave by name prefix.
+ * Discovery generates variable names as "{slaveName}.{entryName}",
+ * so we can match when processData address ranges are missing.
+ */
+function matchVariableToSlaveByName(
+  variableName: string,
+  slaves: EniConfig["slaves"],
+): number {
+  const dotIndex = variableName.indexOf(".");
+  if (dotIndex <= 0) return -1;
+  const prefix = variableName.substring(0, dotIndex);
+  return slaves.findIndex((s) => s.name === prefix);
+}
+
+/**
  * Build process data mappings from ENI configuration.
  * Uses processImage.variables as the primary source of truth (they have correct global bitOffsets).
  * Matches variables to slaves by checking explicit address ranges from ENI file.
@@ -53,7 +68,10 @@ export function buildProcessDataMappings(
     // Byte offset relative to PDI start (Outputs are first)
     const pdiByteOffset = Math.floor(v.bitOffset / 8);
 
-    const slaveIndex = matchVariableToSlave(v.bitOffset, false, eniConfig.slaves);
+    let slaveIndex = matchVariableToSlave(v.bitOffset, false, eniConfig.slaves);
+    if (slaveIndex < 0) {
+      slaveIndex = matchVariableToSlaveByName(v.name, eniConfig.slaves);
+    }
 
     if (slaveIndex >= 0) {
       mappings.set(v.name, {
@@ -73,7 +91,10 @@ export function buildProcessDataMappings(
     // Byte offset relative to PDI start: Add Output Size
     const pdiByteOffset = outputSize + Math.floor(v.bitOffset / 8);
 
-    const slaveIndex = matchVariableToSlave(v.bitOffset, true, eniConfig.slaves);
+    let slaveIndex = matchVariableToSlave(v.bitOffset, true, eniConfig.slaves);
+    if (slaveIndex < 0) {
+      slaveIndex = matchVariableToSlaveByName(v.name, eniConfig.slaves);
+    }
 
     if (slaveIndex >= 0) {
       mappings.set(v.name, {
