@@ -2431,3 +2431,8 @@ pub extern "C" fn ethercrab_scan_free(ctx: *mut ScanContext) {
         }
     })
 }
+
+// --- Unit Tests ---
+
+#[cfg(test)]
+mod error_tests;

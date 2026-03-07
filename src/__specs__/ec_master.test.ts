@@ -3,7 +3,7 @@ import { assertSpyCall, spy, stub } from "@std/testing/mock";
 import { EcMaster } from "../ec_master.ts";
 import type { EniConfig } from "../types/eni-config.ts";
 import type { EmergencyEvent } from "../types/ec_types.ts";
-import { FfiError, PdoIntegrityError } from "../types/errors.ts";
+import { EtherCatError, FfiError, PdoIntegrityError, StateTransitionError } from "../types/errors.ts";
 
 /**
  * Tests for startEmergencyPolling method (lines 878-879)
@@ -560,7 +560,7 @@ Deno.test("Mailbox Resilience: Retry Failure Handling", async () => {
 // --- Ride-Through Logic Tests (Feature 105) ---
 
 // Extended mock symbols for runCycle tests
-const createCycleMockSymbols = (cyclicTxRxFn: () => number) => ({
+const createCycleMockSymbols = (cyclicTxRxFn: () => number, errorMsg = "Test error") => ({
   ethercrab_init: () => 0,
   ethercrab_get_pdi_total_size: () => 0,
   ethercrab_get_pdi_buffer_ptr: () => Deno.UnsafePointer.create(0n),
@@ -569,8 +569,7 @@ const createCycleMockSymbols = (cyclicTxRxFn: () => number) => ({
   ethercrab_destroy: () => {},
   ethercrab_get_state: () => 1, // INIT state
   ethercrab_get_last_error: (buf: Uint8Array, _len: bigint) => {
-    const msg = "Test error";
-    const encoded = new TextEncoder().encode(msg);
+    const encoded = new TextEncoder().encode(errorMsg);
     buf.set(encoded);
     return encoded.length;
   },
@@ -587,8 +586,8 @@ const createCycleMockSymbols = (cyclicTxRxFn: () => number) => ({
   ethercrab_get_error_detail: (_buf: Uint8Array, _len: bigint, _index: number) => 0,
 });
 
-function createCycleTestMaster(cyclicTxRxFn: () => number) {
-  const mockSyms = createCycleMockSymbols(cyclicTxRxFn);
+function createCycleTestMaster(cyclicTxRxFn: () => number, errorMsg?: string) {
+  const mockSyms = createCycleMockSymbols(cyclicTxRxFn, errorMsg);
 
   const dlopenStub = stub(Deno, "dlopen", () => ({
     symbols: mockSyms,
@@ -781,4 +780,87 @@ Deno.test("Ride-Through: missedCycleCount is accessible for diagnostics", async 
     dlopenStub.restore();
     statStub.restore();
   }
+});
+
+// ============================================================================
+// Structured Error Context Tests
+// ============================================================================
+
+Deno.test("Structured errors: FfiError carries context on critical timeout", async () => {
+  const context = {
+    op: "cyclic_tx_rx",
+    expected_wkc: "3",
+    pdu_timeout_ms: "2000",
+    error_detail: "Timeout",
+    suggestion: "Increase runtimeOptions.pduTimeoutMs",
+  };
+  const contextJson = JSON.stringify(context);
+
+  // Mock getLastError to return structured error with || delimiter
+  const { master, dlopenStub, statStub } = createCycleTestMaster(
+    () => -2, // wkc timeout
+    `Cyclic tx_rx failed: Timeout||${contextJson}`,
+  );
+
+  try {
+    // MAX_MISSED_CYCLES is 5 — first 4 return -2 without throwing
+    for (let i = 0; i < 4; i++) {
+      await master.runCycle();
+    }
+    // 5th call should throw FfiError with structured context
+    await assertRejects(
+      () => master.runCycle(),
+      FfiError,
+    );
+  } finally {
+    await master.close();
+    dlopenStub.restore();
+    statStub.restore();
+  }
+});
+
+Deno.test("Structured errors: FfiError without || delimiter has no context", () => {
+  const error = new FfiError("Simple error message", -2);
+  assertEquals(error.context, undefined, "FfiError without context should have undefined context");
+  assertEquals(error.code, -2);
+  assertEquals(error.name, "FfiError");
+});
+
+Deno.test("Structured errors: StateTransitionError has fromState and toState", () => {
+  const ctx = { op: "request_state", from: "PreOp", to: "SafeOp", error_detail: "Timeout" };
+  const error = new StateTransitionError(
+    "State transition failed",
+    0x001E,
+    "PreOp",
+    "SafeOp",
+    ctx,
+  );
+  assertEquals(error.fromState, "PreOp");
+  assertEquals(error.toState, "SafeOp");
+  assertEquals(error.alStatusCode, 0x001E);
+  assertExists(error.context);
+  assertEquals(error.context?.op, "request_state");
+  assertEquals(error.context?.from, "PreOp");
+  assertEquals(error.name, "StateTransitionError");
+});
+
+Deno.test("Structured errors: EtherCatError context is optional (backward compat)", () => {
+  const errorWithout = new EtherCatError("No context");
+  assertEquals(errorWithout.context, undefined);
+  assertEquals(errorWithout.message, "No context");
+
+  const errorWith = new EtherCatError("With context", { key: "value" });
+  assertExists(errorWith.context);
+  assertEquals(errorWith.context?.key, "value");
+});
+
+Deno.test("Structured errors: FfiError includes context and code", () => {
+  const ctx = { op: "sdo_read", slave_index: "2", sdo_index: "0x6040" };
+  const error = new FfiError("SDO read failed", -30, ctx);
+  assertEquals(error.code, -30);
+  assertEquals(error.name, "FfiError");
+  assertExists(error.context);
+  assertEquals(error.context?.op, "sdo_read");
+  assertEquals(error.context?.slave_index, "2");
+  assertEquals(error.context?.sdo_index, "0x6040");
 });
