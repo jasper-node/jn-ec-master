@@ -88,7 +88,7 @@ export class EcMaster extends EventEmitter {
 
   private isClosing = false;
   private isClosed = false;
-  static REQUIRED_FFI_VERSION = "0.1.8";
+  static REQUIRED_FFI_VERSION = "0.1.9";
 
   // Static tracking to prevent creating new instances before previous one is properly closed
   private static activeInstance: EcMaster | null = null;
@@ -143,7 +143,6 @@ export class EcMaster extends EventEmitter {
       const version = new TextDecoder().decode(buf.subarray(0, len));
 
       if (version !== EcMaster.REQUIRED_FFI_VERSION) {
-        lib.close();
         throw new Error(
           `EtherCAT library version mismatch.\n` +
             `Expected: ${EcMaster.REQUIRED_FFI_VERSION}, Found: ${version}\n` +
